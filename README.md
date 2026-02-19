@@ -1,22 +1,48 @@
 # evolver
 
-evolver is a drop-in GitHub Action that makes a repository “self-evolve” on a schedule.
+A GitHub Action + Go CLI that proposes small, safe changes to your repo using Gemini, then either opens a PR or pushes directly.
 
-## Cron Reliability
+## Quick start (PR mode)
 
-For long-running cron usage, evolver now keeps runtime health state and emits explicit alerts:
+```yaml
+name: evolver
 
-- `.evolver/state.json`: latest run status, timestamps, failure/no-op streaks, totals.
-- `.evolver/runs.log`: append-only per-run event log (`start`, `changed`, `noop`, `error`).
-- `.evolver/run.lock`: overlap protection with stale-lock recovery.
+on:
+  schedule:
+    - cron: "0 9 * * 1" # Mondays 09:00 UTC
+  workflow_dispatch:
 
-Default reliability behavior:
+permissions:
+  contents: write
+  pull-requests: write
 
-- Active lock older than `180` minutes is treated as stale and replaced.
+jobs:
+  evolve:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: mmrzaf/evolver@v1
+        with:
+          mode: pr
+          gemini_api_key: ${{ secrets.GEMINI_API_KEY }}
+          repo_goal: "Improve reliability and developer experience"
+          commands: |
+            go test ./...
+            go vet ./...
+```
 
-Tune with environment variables:
+## Inputs
 
-- `EVOLVER_LOCK_STALE_MINUTES`
-- `EVOLVER_STATE_FILE`
-- `EVOLVER_RUN_LOG_FILE`
-- `EVOLVER_LOCK_FILE`
+- `mode`: `pr` or `push` (default: `pr`)
+- `provider`: currently only `gemini` (default: `gemini`)
+- `model`: Gemini model name (default: `gemini-2.5-flash-lite`)
+- `workdir`: directory to run in (default: `.`)
+- `repo_goal`: high-level goal for the agent
+- `commands`: newline-separated verify commands (run after changes)
+- `allow_workflow_edits`: `"true"` to allow `.github/workflows` edits (default: `"false"`)
+- `gemini_api_key`: **required**, pass from secrets
+
+## Outputs
+
+- `changed`: `"true"` if a commit was made
+- `summary`: short summary of the change
+- `pr_url`: PR link (when `mode=pr`)
