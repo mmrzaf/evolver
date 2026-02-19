@@ -1,70 +1,86 @@
-name: "evolver"
-description: "Self-evolving repository action via Gemini"
-author: "mmrzaf"
+name: "Evolver"
+description: "Self-evolving repo agent (Gemini)"
 inputs:
   mode:
-    description: "Run mode (pr|push)"
+    description: "pr|push"
     required: false
     default: "pr"
   provider:
-    description: "LLM provider"
+    description: "LLM provider (currently only: gemini)"
     required: false
     default: "gemini"
   model:
     description: "Model name"
     required: false
-    default: "gemini-1.5-pro"
-  repo_goal:
-    description: "Seed intent for the repository"
-    required: false
-    default: ""
+    default: "gemini-2.5-flash-lite"
   workdir:
     description: "Working directory"
     required: false
     default: "."
-  max_files_changed:
-    description: "Budget override for max files"
+  repo_goal:
+    description: "High-level goal"
     required: false
-    default: "10"
-  max_lines_changed:
-    description: "Budget override for max lines"
-    required: false
-    default: "500"
+    default: ""
   commands:
-    description: "Override verification commands"
+    description: "Newline-separated verification commands"
     required: false
     default: ""
   allow_workflow_edits:
-    description: "Allow editing workflows"
+    description: "Allow .github/workflows edits"
     required: false
     default: "false"
+  github_token:
+    description: "Optional GitHub token override (defaults to github.token)"
+    required: false
+    default: ""
+  gemini_api_key:
+    description: "Gemini API key (pass from secrets)"
+    required: true
+
 outputs:
   changed:
-    description: "Whether changes were made"
-    value: ${{ steps.run-evolver.outputs.changed }}
+    description: "Whether repo changed"
+    value: ${{ steps.evolver.outputs.changed }}
   summary:
-    description: "Run summary"
-    value: ${{ steps.run-evolver.outputs.summary }}
+    description: "Summary of changes"
+    value: ${{ steps.evolver.outputs.summary }}
   pr_url:
-    description: "Pull Request URL"
-    value: ${{ steps.run-evolver.outputs.pr_url }}
+    description: "Pull request URL when mode=pr"
+    value: ${{ steps.evolver.outputs.pr_url }}
+
 runs:
   using: "composite"
   steps:
-    - name: Install evolver
+    - name: "Checkout repository"
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+
+    - name: "Set up Go"
+      uses: actions/setup-go@v6
+      with:
+        go-version-file: ${{ github.action_path }}/go.mod
+        cache: true
+
+    - name: "Install evolver"
       shell: bash
-      run: ${{ github.action_path }}/dist/install.sh
-    - name: Run evolver
-      id: run-evolver
+      run: |
+        set -euo pipefail
+        "${{ github.action_path }}/dist/install.sh"
+
+    - name: "Run evolver"
+      id: evolver
       shell: bash
+      run: |
+        set -euo pipefail
+        evolver
       env:
         EVOLVER_MODE: ${{ inputs.mode }}
         EVOLVER_PROVIDER: ${{ inputs.provider }}
         EVOLVER_MODEL: ${{ inputs.model }}
-        EVOLVER_REPO_GOAL: ${{ inputs.repo_goal }}
         EVOLVER_WORKDIR: ${{ inputs.workdir }}
-        EVOLVER_MAX_FILES: ${{ inputs.max_files_changed }}
-        EVOLVER_MAX_LINES: ${{ inputs.max_lines_changed }}
+        EVOLVER_REPO_GOAL: ${{ inputs.repo_goal }}
         EVOLVER_COMMANDS: ${{ inputs.commands }}
         EVOLVER_ALLOW_WORKFLOWS: ${{ inputs.allow_workflow_edits }}
-      run: evolver
+        GITHUB_TOKEN: ${{ inputs.github_token != '' && inputs.github_token || github.token }}
+        GEMINI_API_KEY: ${{ inputs.gemini_api_key }}
