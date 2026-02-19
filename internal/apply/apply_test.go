@@ -43,3 +43,22 @@ func TestExecuteWritesFilesAndIsRepeatable(t *testing.T) {
 		t.Fatalf("non-write mode should not create file")
 	}
 }
+
+func TestExecuteRejectsTraversalPath(t *testing.T) {
+	tmp := t.TempDir()
+	wd, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chdir(wd) })
+	if err := os.Chdir(tmp); err != nil {
+		t.Fatalf("chdir: %v", err)
+	}
+
+	p := &plan.Plan{
+		Files: []plan.File{{Path: "../../pwned", Mode: "write", Content: "x"}},
+	}
+	if err := Execute(p); err == nil {
+		t.Fatalf("expected unsafe path to be rejected")
+	}
+}

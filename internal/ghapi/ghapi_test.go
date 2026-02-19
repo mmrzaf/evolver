@@ -28,14 +28,12 @@ func withRedirectedGitHubAPI(t *testing.T, srv *httptest.Server) {
 	if err != nil {
 		t.Fatalf("parse server url: %v", err)
 	}
-	orig := http.DefaultClient.Transport
+	orig := httpClient.Transport
 	if orig == nil {
 		orig = http.DefaultTransport
 	}
-	http.DefaultClient.Transport = &rewriteTransport{base: orig, target: u}
-	t.Cleanup(func() {
-		http.DefaultClient.Transport = orig
-	})
+	httpClient.Transport = &rewriteTransport{base: srv.Client().Transport, target: u}
+	t.Cleanup(func() { httpClient.Transport = orig })
 }
 
 func TestGetDefaultBranchReturnsValueFromAPI(t *testing.T) {
@@ -92,11 +90,11 @@ func TestCreatePRBuildsRequestAndReturnsURL(t *testing.T) {
 }
 
 func TestGetDefaultBranchFallbackOnTransportError(t *testing.T) {
-	orig := http.DefaultClient.Transport
-	http.DefaultClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+	orig := httpClient.Transport
+	httpClient.Transport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
 		return nil, os.ErrDeadlineExceeded
 	})
-	t.Cleanup(func() { http.DefaultClient.Transport = orig })
+	t.Cleanup(func() { httpClient.Transport = orig })
 
 	if got := getDefaultBranch("acme/repo", "token"); got != "main" {
 		t.Fatalf("expected fallback branch main, got %s", got)
@@ -105,6 +103,4 @@ func TestGetDefaultBranchFallbackOnTransportError(t *testing.T) {
 
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
-func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) {
-	return f(req)
-}
+func (f roundTripperFunc) RoundTrip(req *http.Request) (*http.Response, error) { return f(req) }

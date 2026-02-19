@@ -8,8 +8,9 @@ import (
 
 func TestValidatePathsRejectsDeniedPath(t *testing.T) {
 	cfg := &config.Config{
-		DenyPaths: []string{".github/workflows/", ".git/"},
-		Security:  config.Security{AllowWorkflowEdits: false},
+		AllowPaths: []string{"."},
+		DenyPaths:  []string{".github/workflows/", ".git/"},
+		Security:   config.Security{AllowWorkflowEdits: false},
 	}
 	p := &Plan{
 		Files: []File{{Path: ".github/workflows/ci.yml", Mode: "write", Content: "name: CI"}},
@@ -21,8 +22,9 @@ func TestValidatePathsRejectsDeniedPath(t *testing.T) {
 
 func TestValidatePathsAllowsWorkflowsWhenExplicitlyEnabled(t *testing.T) {
 	cfg := &config.Config{
-		DenyPaths: []string{".github/workflows/", ".git/"},
-		Security:  config.Security{AllowWorkflowEdits: true},
+		AllowPaths: []string{"."},
+		DenyPaths:  []string{".github/workflows/", ".git/"},
+		Security:   config.Security{AllowWorkflowEdits: true},
 	}
 	p := &Plan{
 		Files: []File{{Path: ".github/workflows/ci.yml", Mode: "write", Content: "name: CI"}},
@@ -32,10 +34,53 @@ func TestValidatePathsAllowsWorkflowsWhenExplicitlyEnabled(t *testing.T) {
 	}
 }
 
+func TestValidatePathsRejectsTraversal(t *testing.T) {
+	cfg := &config.Config{
+		AllowPaths: []string{"."},
+		DenyPaths:  []string{".git/"},
+		Security:   config.Security{AllowWorkflowEdits: false},
+	}
+	p := &Plan{
+		Files: []File{{Path: "../../pwned.txt", Mode: "write", Content: "x"}},
+	}
+	if err := ValidatePaths(p, cfg); err == nil {
+		t.Fatalf("expected traversal path to fail validation")
+	}
+}
+
+func TestValidatePathsRejectsAbsolute(t *testing.T) {
+	cfg := &config.Config{
+		AllowPaths: []string{"."},
+		DenyPaths:  []string{},
+		Security:   config.Security{AllowWorkflowEdits: false},
+	}
+	p := &Plan{
+		Files: []File{{Path: "/etc/passwd", Mode: "write", Content: "x"}},
+	}
+	if err := ValidatePaths(p, cfg); err == nil {
+		t.Fatalf("expected absolute path to fail validation")
+	}
+}
+
+func TestValidatePathsEnforcesAllowPaths(t *testing.T) {
+	cfg := &config.Config{
+		AllowPaths: []string{"docs"},
+		DenyPaths:  []string{},
+		Security:   config.Security{AllowWorkflowEdits: true},
+	}
+	p := &Plan{
+		Files: []File{{Path: "README.md", Mode: "write", Content: "# no"}},
+	}
+	if err := ValidatePaths(p, cfg); err == nil {
+		t.Fatalf("expected path outside allow_paths to fail validation")
+	}
+}
+
 func TestValidatePathsAllowsSafeFiles(t *testing.T) {
 	cfg := &config.Config{
-		DenyPaths: []string{".github/workflows/", ".git/"},
-		Security:  config.Security{AllowWorkflowEdits: false},
+		AllowPaths: []string{"."},
+		DenyPaths:  []string{".github/workflows/", ".git/"},
+		Security:   config.Security{AllowWorkflowEdits: false},
 	}
 	p := &Plan{
 		Files: []File{

@@ -10,6 +10,7 @@ import (
 
 // Config controls runtime behavior for the evolver.
 type Config struct {
+	Provider    string      `yaml:"provider"`
 	Mode        string      `yaml:"mode"`
 	Model       string      `yaml:"model"`
 	RepoGoal    string      `yaml:"repo_goal,omitempty"`
@@ -46,21 +47,32 @@ type Reliability struct {
 // Load builds config from defaults, file values, and environment overrides.
 func Load() *Config {
 	c := &Config{
-		Mode:        "pr",
-		Model:       "gemini-1.5-pro",
-		Workdir:     ".",
-		Budgets:     Budgets{MaxFilesChanged: 10, MaxLinesChanged: 500, MaxNewFiles: 10},
-		Commands:    []string{},
-		AllowPaths:  []string{"."},
-		DenyPaths:   []string{".git/", ".github/workflows/", "node_modules/"},
-		Security:    Security{AllowWorkflowEdits: false, SecretScan: true},
-		Reliability: Reliability{StateFile: ".evolver/state.json", RunLogFile: ".evolver/runs.log", LockFile: ".evolver/run.lock", LockStaleMinutes: 180},
+		Provider:   "gemini",
+		Mode:       "pr",
+		Model:      "gemini-2.5-flash-lite",
+		Workdir:    ".",
+		Budgets:    Budgets{MaxFilesChanged: 10, MaxLinesChanged: 500, MaxNewFiles: 10},
+		Commands:   []string{},
+		AllowPaths: []string{"."},
+		DenyPaths:  []string{".git/", ".github/workflows/", "node_modules/"},
+		Security:   Security{AllowWorkflowEdits: false, SecretScan: true},
+		Reliability: Reliability{
+			StateFile:        ".evolver/state.json",
+			RunLogFile:       ".evolver/runs.log",
+			LockFile:         ".evolver/run.lock",
+			LockStaleMinutes: 180,
+		},
 	}
 
+	// Config file overrides defaults.
 	if b, err := os.ReadFile(".evolver/config.yml"); err == nil {
 		_ = yaml.Unmarshal(b, c)
 	}
 
+	// Environment overrides file and defaults.
+	if v := os.Getenv("EVOLVER_PROVIDER"); v != "" {
+		c.Provider = v
+	}
 	if v := os.Getenv("EVOLVER_MODE"); v != "" {
 		c.Mode = v
 	}
@@ -79,8 +91,20 @@ func Load() *Config {
 	if v := os.Getenv("EVOLVER_MAX_LINES"); v != "" {
 		c.Budgets.MaxLinesChanged, _ = strconv.Atoi(v)
 	}
+	if v := os.Getenv("EVOLVER_MAX_NEW_FILES"); v != "" {
+		c.Budgets.MaxNewFiles, _ = strconv.Atoi(v)
+	}
 	if v := os.Getenv("EVOLVER_COMMANDS"); v != "" {
-		c.Commands = strings.Split(v, "\n")
+		// Newline-separated; ignore blank lines.
+		parts := strings.Split(v, "\n")
+		c.Commands = c.Commands[:0]
+		for _, p := range parts {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			c.Commands = append(c.Commands, p)
+		}
 	}
 	if v := os.Getenv("EVOLVER_ALLOW_WORKFLOWS"); v == "true" {
 		c.Security.AllowWorkflowEdits = true

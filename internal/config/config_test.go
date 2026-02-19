@@ -18,13 +18,16 @@ func TestLoadDefaults(t *testing.T) {
 	}
 
 	c := Load()
+	if c.Provider != "gemini" {
+		t.Fatalf("unexpected provider: %s", c.Provider)
+	}
 	if c.Mode != "pr" {
 		t.Fatalf("unexpected mode: %s", c.Mode)
 	}
-	if c.Model != "gemini-1.5-pro" {
+	if c.Model != "gemini-2.5-flash-lite" {
 		t.Fatalf("unexpected model: %s", c.Model)
 	}
-	if c.Budgets.MaxFilesChanged != 10 || c.Budgets.MaxLinesChanged != 500 {
+	if c.Budgets.MaxFilesChanged != 10 || c.Budgets.MaxLinesChanged != 500 || c.Budgets.MaxNewFiles != 10 {
 		t.Fatalf("unexpected budgets: %+v", c.Budgets)
 	}
 	if !c.Security.SecretScan {
@@ -49,17 +52,19 @@ func TestLoadFromFileAndEnvOverrides(t *testing.T) {
 	if err := os.MkdirAll(".evolver", 0755); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
-	cfgYAML := []byte("mode: push\nmodel: test-model\nworkdir: /tmp/project\nbudgets:\n  max_files_changed: 3\n  max_lines_changed: 25\n")
+	cfgYAML := []byte("provider: gemini\nmode: push\nmodel: test-model\nworkdir: /tmp/project\nbudgets:\n  max_files_changed: 3\n  max_lines_changed: 25\n  max_new_files: 2\n")
 	if err := os.WriteFile(filepath.Join(".evolver", "config.yml"), cfgYAML, 0644); err != nil {
 		t.Fatalf("write config: %v", err)
 	}
 
+	t.Setenv("EVOLVER_PROVIDER", "gemini")
 	t.Setenv("EVOLVER_MODE", "pr")
 	t.Setenv("EVOLVER_MODEL", "override-model")
 	t.Setenv("EVOLVER_REPO_GOAL", "Ship safely")
 	t.Setenv("EVOLVER_WORKDIR", "/work/dir")
 	t.Setenv("EVOLVER_MAX_FILES", "7")
 	t.Setenv("EVOLVER_MAX_LINES", "99")
+	t.Setenv("EVOLVER_MAX_NEW_FILES", "5")
 	t.Setenv("EVOLVER_COMMANDS", "go test ./...\ngo vet ./...")
 	t.Setenv("EVOLVER_ALLOW_WORKFLOWS", "true")
 	t.Setenv("EVOLVER_STATE_FILE", ".evolver/custom_state.json")
@@ -68,6 +73,9 @@ func TestLoadFromFileAndEnvOverrides(t *testing.T) {
 	t.Setenv("EVOLVER_LOCK_STALE_MINUTES", "45")
 
 	c := Load()
+	if c.Provider != "gemini" {
+		t.Fatalf("expected env provider override, got %s", c.Provider)
+	}
 	if c.Mode != "pr" {
 		t.Fatalf("expected env mode override, got %s", c.Mode)
 	}
@@ -80,7 +88,7 @@ func TestLoadFromFileAndEnvOverrides(t *testing.T) {
 	if c.Workdir != "/work/dir" {
 		t.Fatalf("expected workdir override, got %s", c.Workdir)
 	}
-	if c.Budgets.MaxFilesChanged != 7 || c.Budgets.MaxLinesChanged != 99 {
+	if c.Budgets.MaxFilesChanged != 7 || c.Budgets.MaxLinesChanged != 99 || c.Budgets.MaxNewFiles != 5 {
 		t.Fatalf("expected budget overrides, got %+v", c.Budgets)
 	}
 	if len(c.Commands) != 2 || c.Commands[0] != "go test ./..." || c.Commands[1] != "go vet ./..." {

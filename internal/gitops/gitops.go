@@ -14,7 +14,10 @@ func init() {
 
 // CheckoutNew creates and checks out a new git branch.
 func CheckoutNew(branch string) error {
-	return exec.Command("git", "checkout", "-b", branch).Run()
+	cmd := exec.Command("git", "checkout", "-b", branch)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 // ResetHard resets tracked and untracked files in the repository.
@@ -23,9 +26,28 @@ func ResetHard() {
 	_ = exec.Command("git", "clean", "-fd").Run()
 }
 
+// HasChanges reports whether the working tree has any changes (staged or unstaged).
+func HasChanges() (bool, error) {
+	out, err := exec.Command("git", "status", "--porcelain").Output()
+	if err != nil {
+		return false, err
+	}
+	return strings.TrimSpace(string(out)) != "", nil
+}
+
+// StageAll stages all changes.
+func StageAll() error {
+	cmd := exec.Command("git", "add", ".")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
 // DiffStats returns staged file and line-change counts.
 func DiffStats() (files, lines int, err error) {
-	_ = exec.Command("git", "add", ".").Run()
+	if err := StageAll(); err != nil {
+		return 0, 0, err
+	}
 	out, err := exec.Command("git", "diff", "--cached", "--numstat").Output()
 	if err != nil {
 		return 0, 0, err
@@ -43,9 +65,30 @@ func DiffStats() (files, lines int, err error) {
 	return files, lines, nil
 }
 
+// NewFilesCount returns how many files are staged as newly added.
+func NewFilesCount() (int, error) {
+	if err := StageAll(); err != nil {
+		return 0, err
+	}
+	out, err := exec.Command("git", "diff", "--cached", "--name-status", "--diff-filter=A").Output()
+	if err != nil {
+		return 0, err
+	}
+	count := 0
+	for _, line := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+		if strings.TrimSpace(line) == "" {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
 // Commit creates a commit from the current working tree.
 func Commit(msg string) error {
-	_ = exec.Command("git", "add", ".").Run()
+	if err := StageAll(); err != nil {
+		return err
+	}
 	cmd := exec.Command("git", "commit", "-m", msg)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

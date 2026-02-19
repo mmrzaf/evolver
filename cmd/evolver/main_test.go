@@ -2,6 +2,7 @@ package main
 
 import (
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -13,13 +14,14 @@ func TestGeneratePRBodyIncludesCoreSections(t *testing.T) {
 		Summary:       "Improve retry logic",
 		RoadmapUpdate: "- [x] Added backoff",
 	}
-	body := generatePRBody(p, 3, 42)
+	body := generatePRBody(p, 3, 42, 1)
 
 	mustContain := []string{
 		"## Summary",
 		"Improve retry logic",
-		"- Files: 3",
-		"- Lines: 42",
+		"- Files changed: 3",
+		"- Lines changed: 42",
+		"- New files: 1",
 		"## Roadmap Update",
 		"- [x] Added backoff",
 	}
@@ -46,7 +48,16 @@ func TestSetOutputWritesGithubOutputFile(t *testing.T) {
 		t.Fatalf("read output file: %v", err)
 	}
 	got := string(b)
-	if !strings.Contains(got, "summary=line1 line2\n") {
-		t.Fatalf("expected sanitized output value, got %q", got)
+
+	if !strings.Contains(got, "summary<<EVOLVER_") {
+		t.Fatalf("expected multiline output format, got %q", got)
+	}
+	if !strings.Contains(got, "line1\nline2\n") {
+		t.Fatalf("expected value written as-is, got %q", got)
+	}
+
+	re := regexp.MustCompile(`summary<<EVOLVER_\d+\nline1\nline2\nEVOLVER_\d+\n`)
+	if !re.MatchString(got) {
+		t.Fatalf("unexpected output format: %q", got)
 	}
 }

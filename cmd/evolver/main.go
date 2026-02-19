@@ -64,17 +64,30 @@ func run() (err error) {
 		return err
 	}
 
-	client := gemini.NewClient(os.Getenv("GEMINI_API_KEY"), cfg.Model)
-	p, err := client.GeneratePlan(ctx, cfg)
+	var p *plan.Plan
+	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
+	case "", "gemini":
+		client := gemini.NewClient(os.Getenv("GEMINI_API_KEY"), cfg.Model)
+		p, err = client.GeneratePlan(ctx, cfg)
+	default:
+		return fmt.Errorf("unsupported provider: %s", cfg.Provider)
+	}
 	if err != nil {
 		return err
 	}
 
-	if len(p.Files) == 0 {
-		summary = "No changes proposed"
-		setOutput("changed", "false")
-		setOutput("summary", summary)
-		return nil
+	// If the LLM proposes no changes, we still might have bootstrap changes to commit.
+	if len(p.Files) == 0 && p.ChangelogEntry == "" && p.RoadmapUpdate == "" {
+		dirty, derr := gitops.HasChanges()
+		if derr == nil && !dirty {
+			summary = "No changes proposed"
+			setOutput("changed", "false")
+			setOutput("summary", summary)
+			return nil
+		}
+		if strings.TrimSpace(p.Summary) == "" {
+			p.Summary = "Bootstrap evolver scaffolding"
+		}
 	}
 
 	if cfg.Security.SecretScan {
@@ -82,7 +95,6 @@ func run() (err error) {
 			return err
 		}
 	}
-
 	if err := plan.ValidatePaths(p, cfg); err != nil {
 		return err
 	}
@@ -98,20 +110,6 @@ func run() (err error) {
 		return err
 	}
 
-	if err := verify.RunCommands(cfg.Commands); err != nil {
-		gitops.ResetHard()
-		return err
-	}
-
-	filesChanged, linesChanged, err := gitops.DiffStats()
-	if err != nil {
-		return err
-	}
-	if filesChanged > cfg.Budgets.MaxFilesChanged || linesChanged > cfg.Budgets.MaxLinesChanged {
-		gitops.ResetHard()
-		return fmt.Errorf("budget exceeded: %d files, %d lines", filesChanged, linesChanged)
-	}
-
 	if err := policy.AppendChangelog(p.ChangelogEntry); err != nil {
 		return err
 	}
@@ -119,6 +117,33 @@ func run() (err error) {
 		if err := policy.UpdateRoadmap(p.RoadmapUpdate); err != nil {
 			return err
 		}
+	}
+
+	filesChanged, linesChanged, err := gitops.DiffStats()
+	if err != nil {
+		return err
+	}
+	newFiles, err := gitops.NewFilesCount()
+	if err != nil {
+		return err
+	}
+
+	// No actual changes after applying everything => stop without committing.
+	if filesChanged == 0 && linesChanged == 0 && newFiles == 0 {
+		summary = "No changes produced"
+		setOutput("changed", "false")
+		setOutput("summary", summary)
+		return nil
+	}
+
+	if filesChanged > cfg.Budgets.MaxFilesChanged || linesChanged > cfg.Budgets.MaxLinesChanged || newFiles > cfg.Budgets.MaxNewFiles {
+		gitops.ResetHard()
+		return fmt.Errorf("budget exceeded: %d files, %d lines, %d new files", filesChanged, linesChanged, newFiles)
+	}
+
+	if err := verify.RunCommands(cfg.Commands); err != nil {
+		gitops.ResetHard()
+		return err
 	}
 
 	if err := gitops.Commit(p.Summary); err != nil {
@@ -129,7 +154,7 @@ func run() (err error) {
 		if err := gitops.Push(branchName); err != nil {
 			return err
 		}
-		url, err := ghapi.CreatePR(branchName, p.Summary, generatePRBody(p, filesChanged, linesChanged))
+		url, err := ghapi.CreatePR(branchName, p.Summary, generatePRBody(p, filesChanged, linesChanged, newFiles))
 		if err != nil {
 			return err
 		}
@@ -147,24 +172,33 @@ func run() (err error) {
 	return nil
 }
 
-func generatePRBody(p *plan.Plan, f, l int) string {
-	return fmt.Sprintf("## Summary\n%s\n\n## Stats\n- Files: %d\n- Lines: %d\n\n## Roadmap Update\n%s\n", p.Summary, f, l, p.RoadmapUpdate)
+func generatePRBody(p *plan.Plan, filesChanged, linesChanged, newFiles int) string {
+	return fmt.Sprintf("## Summary\n%s\n\n## Stats\n- Files changed: %d\n- Lines changed: %d\n- New files: %d\n\n## Roadmap Update\n%s\n", p.Summary, filesChanged, linesChanged, newFiles, p.RoadmapUpdate)
 }
 
 func setOutput(key, value string) {
 	out := os.Getenv("GITHUB_OUTPUT")
-	if out != "" {
-		f, err := os.OpenFile(out, os.O_APPEND|os.O_WRONLY, 0644)
-		if err == nil {
-			defer func() {
-				if cerr := f.Close(); cerr != nil {
-					fmt.Fprintf(os.Stderr, "failed to close %s: %v\n", out, cerr)
-				}
-			}()
-			if _, werr := fmt.Fprintf(f, "%s=%s\n", key, strings.ReplaceAll(value, "\n", " ")); werr != nil {
-				fmt.Fprintf(os.Stderr, "failed to write %s: %v\n", out, werr)
-			}
-		}
+	if out == "" {
+		return
 	}
-	fmt.Printf("::set-output name=%s::%s\n", key, value)
+
+	f, err := os.OpenFile(out, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to open %s: %v\n", out, err)
+		return
+	}
+	defer func() {
+		if cerr := f.Close(); cerr != nil {
+			fmt.Fprintf(os.Stderr, "failed to close %s: %v\n", out, cerr)
+		}
+	}()
+
+	delimiter := fmt.Sprintf("EVOLVER_%d", time.Now().UnixNano())
+	for strings.Contains(value, delimiter) {
+		delimiter = fmt.Sprintf("EVOLVER_%d", time.Now().UnixNano())
+	}
+
+	if _, err := fmt.Fprintf(f, "%s<<%s\n%s\n%s\n", key, delimiter, value, delimiter); err != nil {
+		fmt.Fprintf(os.Stderr, "failed to write %s: %v\n", out, err)
+	}
 }
