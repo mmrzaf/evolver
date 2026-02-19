@@ -1,0 +1,70 @@
+name: "evolver"
+description: "Self-evolving repository action via Gemini"
+author: "mmrzaf"
+inputs:
+  mode:
+    description: "Run mode (pr|push)"
+    required: false
+    default: "pr"
+  provider:
+    description: "LLM provider"
+    required: false
+    default: "gemini"
+  model:
+    description: "Model name"
+    required: false
+    default: "gemini-1.5-pro"
+  repo_goal:
+    description: "Seed intent for the repository"
+    required: false
+    default: ""
+  workdir:
+    description: "Working directory"
+    required: false
+    default: "."
+  max_files_changed:
+    description: "Budget override for max files"
+    required: false
+    default: "10"
+  max_lines_changed:
+    description: "Budget override for max lines"
+    required: false
+    default: "500"
+  commands:
+    description: "Override verification commands"
+    required: false
+    default: ""
+  allow_workflow_edits:
+    description: "Allow editing workflows"
+    required: false
+    default: "false"
+outputs:
+  changed:
+    description: "Whether changes were made"
+    value: ${{ steps.run-evolver.outputs.changed }}
+  summary:
+    description: "Run summary"
+    value: ${{ steps.run-evolver.outputs.summary }}
+  pr_url:
+    description: "Pull Request URL"
+    value: ${{ steps.run-evolver.outputs.pr_url }}
+runs:
+  using: "composite"
+  steps:
+    - name: Install evolver
+      shell: bash
+      run: ${{ github.action_path }}/dist/install.sh
+    - name: Run evolver
+      id: run-evolver
+      shell: bash
+      env:
+        EVOLVER_MODE: ${{ inputs.mode }}
+        EVOLVER_PROVIDER: ${{ inputs.provider }}
+        EVOLVER_MODEL: ${{ inputs.model }}
+        EVOLVER_REPO_GOAL: ${{ inputs.repo_goal }}
+        EVOLVER_WORKDIR: ${{ inputs.workdir }}
+        EVOLVER_MAX_FILES: ${{ inputs.max_files_changed }}
+        EVOLVER_MAX_LINES: ${{ inputs.max_lines_changed }}
+        EVOLVER_COMMANDS: ${{ inputs.commands }}
+        EVOLVER_ALLOW_WORKFLOWS: ${{ inputs.allow_workflow_edits }}
+      run: evolver
