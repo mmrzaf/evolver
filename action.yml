@@ -66,7 +66,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        "${{ github.action_path }}/dist/install.sh"
+        bash "${{ github.action_path }}/dist/install.sh"
 
     - name: "Run evolver"
       id: evolver

@@ -86,8 +86,9 @@ slices:
         priority: 15
     docs:
         include:
-            - README*
-            - ARCHITECTURE*
+            - README.md
+            - ARCHITECTURE.md
+            - action.yml
         exclude: []
         priority: 20
     domain:
@@ -162,3 +163,12 @@ profiles:
             max_chars: 120000
         render:
             tree_depth: 4
+
+    docs:
+        enable:
+            - docs
+        budgets:
+            max_chars: 120000
+        render:
+            tree_depth: 4
+
