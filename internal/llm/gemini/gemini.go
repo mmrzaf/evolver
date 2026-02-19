@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"strings"
+	"time"
 
 	"github.com/mmrzaf/evolver/internal/config"
 	"github.com/mmrzaf/evolver/internal/plan"
@@ -13,19 +16,68 @@ import (
 
 // Client calls the Gemini API to generate repository evolution plans.
 type Client struct {
-	APIKey string
-	Model  string
+	APIKey         string
+	Model          string
+	HTTP           *http.Client
+	MaxAttempts    int
+	RetryBaseDelay time.Duration
 }
 
 // NewClient creates a Gemini client.
 func NewClient(apiKey, model string) *Client {
-	return &Client{APIKey: apiKey, Model: model}
+	return &Client{
+		APIKey:         apiKey,
+		Model:          model,
+		HTTP:           &http.Client{Timeout: 60 * time.Second},
+		MaxAttempts:    2,
+		RetryBaseDelay: 300 * time.Millisecond,
+	}
 }
 
 // GeneratePlan asks Gemini for a structured change plan for the repository.
 func (c *Client) GeneratePlan(ctx *repoctx.Context, cfg *config.Config) (*plan.Plan, error) {
+	if strings.TrimSpace(c.APIKey) == "" {
+		return nil, fmt.Errorf("missing GEMINI_API_KEY")
+	}
 	prompt := buildPrompt(ctx, cfg)
 
+	var lastErr error
+	for attempt := 1; attempt <= c.MaxAttempts; attempt++ {
+		text, err := c.generateContent(prompt)
+		if err != nil {
+			lastErr = err
+			if attempt < c.MaxAttempts {
+				c.waitBeforeRetry(attempt)
+				continue
+			}
+			break
+		}
+
+		p, err := parsePlan(text)
+		if err == nil {
+			return p, nil
+		}
+		lastErr = err
+
+		if attempt < c.MaxAttempts {
+			prompt = buildFixupPrompt(ctx, cfg, text, err)
+			c.waitBeforeRetry(attempt)
+		}
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("failed to generate plan")
+}
+
+func (c *Client) waitBeforeRetry(attempt int) {
+	if c.RetryBaseDelay <= 0 {
+		return
+	}
+	time.Sleep(time.Duration(attempt) * c.RetryBaseDelay)
+}
+
+func (c *Client) generateContent(prompt string) (string, error) {
 	reqBody := map[string]any{
 		"contents": []map[string]any{{"parts": []map[string]any{{"text": prompt}}}},
 		"generationConfig": map[string]any{
@@ -35,16 +87,26 @@ func (c *Client) GeneratePlan(ctx *repoctx.Context, cfg *config.Config) (*plan.P
 
 	b, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
+
 	url := fmt.Sprintf("https://generativelanguage.googleapis.com/v1beta/models/%s:generateContent?key=%s", c.Model, c.APIKey)
-	resp, err := http.Post(url, "application/json", bytes.NewReader(b))
+	req, err := http.NewRequest("POST", url, bytes.NewReader(b))
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	defer func() {
-		_ = resp.Body.Close()
-	}()
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		return "", fmt.Errorf("gemini http %d: %s", resp.StatusCode, strings.TrimSpace(string(body)))
+	}
 
 	var res struct {
 		Candidates []struct {
@@ -56,29 +118,73 @@ func (c *Client) GeneratePlan(ctx *repoctx.Context, cfg *config.Config) (*plan.P
 		} `json:"candidates"`
 	}
 
-	if err := json.NewDecoder(resp.Body).Decode(&res); err != nil {
-		return nil, err
+	if err := json.Unmarshal(body, &res); err != nil {
+		return "", fmt.Errorf("gemini decode failed: %v", err)
 	}
 	if len(res.Candidates) == 0 || len(res.Candidates[0].Content.Parts) == 0 {
-		return nil, fmt.Errorf("empty response from gemini")
+		return "", fmt.Errorf("empty response from gemini")
+	}
+	return res.Candidates[0].Content.Parts[0].Text, nil
+}
+
+func parsePlan(text string) (*plan.Plan, error) {
+	text = strings.TrimSpace(text)
+
+	// Sometimes the model wraps JSON with fences. Strip common wrappers.
+	text = strings.TrimPrefix(text, "```json")
+	text = strings.TrimPrefix(text, "```")
+	text = strings.TrimSuffix(text, "```")
+	text = strings.TrimSpace(text)
+
+	try := []string{text}
+
+	// Best-effort salvage: extract the first JSON object from the response.
+	if i := strings.Index(text, "{"); i != -1 {
+		if j := strings.LastIndex(text, "}"); j != -1 && j > i {
+			try = append(try, text[i:j+1])
+		}
 	}
 
-	var p plan.Plan
-	if err := json.Unmarshal([]byte(res.Candidates[0].Content.Parts[0].Text), &p); err != nil {
-		return nil, fmt.Errorf("invalid json plan: %v", err)
+	var lastErr error
+	for _, candidate := range try {
+		var p plan.Plan
+		if err := json.Unmarshal([]byte(candidate), &p); err != nil {
+			lastErr = err
+			continue
+		}
+		return &p, nil
 	}
-	return &p, nil
+	if lastErr == nil {
+		lastErr = fmt.Errorf("invalid json")
+	}
+	return nil, fmt.Errorf("invalid json plan: %v", lastErr)
 }
 
 func buildPrompt(ctx *repoctx.Context, cfg *config.Config) string {
 	d, _ := json.Marshal(ctx)
 	return fmt.Sprintf(`You are an autonomous repository evolver.
-Rules:
-- Make small changes. Stay under %d files and %d lines.
-- No workflow edits unless explicitly allowed.
-- Output ONLY valid JSON matching this schema:
+
+Hard rules:
+- Make small, incremental, reviewable changes.
+- Stay under %d files changed, %d lines changed, %d new files.
+- Workflow edits: %t.
+- Output ONLY valid JSON matching this exact schema (no markdown, no commentary):
 {"summary": "...", "files": [{"path": "...", "mode": "write", "content": "..."}], "changelog_entry": "- ...", "roadmap_update": "..."}
 
-Context:
-%s`, cfg.Budgets.MaxFilesChanged, cfg.Budgets.MaxLinesChanged, string(d))
+Repository context (JSON):
+%s`, cfg.Budgets.MaxFilesChanged, cfg.Budgets.MaxLinesChanged, cfg.Budgets.MaxNewFiles, cfg.Security.AllowWorkflowEdits, string(d))
+}
+
+func buildFixupPrompt(ctx *repoctx.Context, cfg *config.Config, lastText string, parseErr error) string {
+	// Keep this short to reduce token waste, but include the invalid payload.
+	return fmt.Sprintf(`Your previous response was invalid and could not be parsed as JSON.
+
+Error:
+%s
+
+Return ONLY valid JSON matching this exact schema (no fences, no commentary):
+{"summary": "...", "files": [{"path": "...", "mode": "write", "content": "..."}], "changelog_entry": "- ...", "roadmap_update": "..."}
+
+Here is your previous response for correction:
+%s`, parseErr.Error(), strings.TrimSpace(lastText))
 }
