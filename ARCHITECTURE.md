@@ -2,10 +2,10 @@
 
 ## 1. Project summary
 
-**evolve** is a drop-in GitHub Action that makes a repository “self-evolve” on a schedule. A target repo only needs a single workflow step:
+**evolver** is a drop-in GitHub Action that makes a repository “self-evolve” on a schedule. A target repo only needs a single workflow step:
 
 ```yaml
-- uses: mmrzaf/evolve@v1
+- uses: mmrzaf/evolveR@v1
   with:
     mode: pr
     repo_goal: "Build a small useful Go CLI for developers"
@@ -58,17 +58,17 @@ The system is designed to be **incremental, constrained, auditable, and safe-by-
 
 Target repo must have:
 
-* A workflow file referencing the action `mmrzaf/evolve@v1`
+* A workflow file referencing the action `mmrzaf/evolver@v1`
 * GitHub Actions secret `GEMINI_API_KEY`
 
 Nothing else is required; the action creates missing control files.
 
 ### 3.2 Typical workflow file
 
-`.github/workflows/evolve.yml`:
+`.github/workflows/evolver.yml`:
 
 ```yaml
-name: evolve
+name: evolver
 on:
   schedule:
     - cron: "17 3 * * *"
@@ -86,7 +86,7 @@ jobs:
   evolve:
     runs-on: ubuntu-latest
     steps:
-      - uses: mmrzaf/evolve@v1
+      - uses: mmrzaf/evolver@v1
         with:
           mode: pr
           model: gemini-1.5-pro
@@ -98,7 +98,7 @@ jobs:
 
 ---
 
-## 4. Repository contract (files evolve manages)
+## 4. Repository contract (files evolver manages)
 
 All files below are **created if missing** during `bootstrap`.
 
@@ -192,7 +192,7 @@ Purpose: keep short memory of prior runs to avoid repetition and to continue wor
 {
   "last_run_utc": "2026-02-19T03:17:00Z",
   "last_summary": "Added CLI skeleton and selfcheck",
-  "last_branch": "evolve/2026-02-19",
+  "last_branch": "evolver/2026-02-19",
   "recent_objectives": [
     "Initialize Go CLI scaffold",
     "Add basic command structure"
@@ -413,8 +413,8 @@ If any command fails:
 
 ### 10.1 Branch naming
 
-`evolve/YYYY-MM-DD`
-If branch exists, append a short suffix (e.g., `evolve/2026-02-19-2`).
+`evolver/YYYY-MM-DD`
+If branch exists, append a short suffix (e.g., `evolver/2026-02-19-2`).
 
 ### 10.2 Commit identity
 
