@@ -28,8 +28,12 @@ go.work.sum
 # env file
 .env
 
+# evolver runtime state (keep .evolver/config.yml versionable)
+.evolver/state.json
+.evolver/runs.log
+.evolver/run.lock
+
 # Editor/IDE
 # .idea/
 # .vscode/
-
 
