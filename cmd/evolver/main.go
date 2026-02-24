@@ -1,10 +1,14 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -22,8 +26,6 @@ import (
 	"github.com/mmrzaf/evolver/internal/security"
 	"github.com/mmrzaf/evolver/internal/verify"
 )
-
-const maxRepairAttempts = 2
 
 func main() {
 	if err := run(); err != nil {
@@ -74,7 +76,6 @@ func run() (err error) {
 	if err := logStep("change_workdir", func() error { return os.Chdir(cfg.Workdir) }); err != nil {
 		return err
 	}
-
 	if err := logStep("policy_bootstrap", func() error { return policy.Bootstrap(cfg) }); err != nil {
 		return err
 	}
@@ -113,37 +114,39 @@ func run() (err error) {
 		}
 	}()
 
-	var ctx *repoctx.Context
+	var repo *repoctx.Context
 	if err := logStep("gather_repo_context", func() error {
 		repoContext, gatherErr := repoctx.Gather(cfg)
 		if gatherErr != nil {
 			return gatherErr
 		}
-		ctx = repoContext
+		repo = repoContext
 		return nil
 	}); err != nil {
 		return err
 	}
-	slog.Info("repository context ready", "files", len(ctx.Files), "excerpts", len(ctx.Excerpts))
+	slog.Info("repository context ready", "files", len(repo.Files), "excerpts", len(repo.Excerpts))
 
-	var client *gemini.Client
+	var (
+		p      *plan.Plan
+		client *gemini.Client
+	)
+
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
 	case "", "gemini":
 		client = gemini.NewClient(os.Getenv("GEMINI_API_KEY"), cfg.Model)
+		if err := logStep("generate_plan_gemini", func() error {
+			planResult, planErr := client.GeneratePlan(repo, cfg)
+			if planErr != nil {
+				return planErr
+			}
+			p = planResult
+			return nil
+		}); err != nil {
+			return err
+		}
 	default:
 		return fmt.Errorf("unsupported provider: %s", cfg.Provider)
-	}
-
-	var p *plan.Plan
-	if err := logStep("generate_plan", func() error {
-		planResult, planErr := client.GeneratePlan(ctx, cfg)
-		if planErr != nil {
-			return planErr
-		}
-		p = planResult
-		return nil
-	}); err != nil {
-		return err
 	}
 	slog.Info("plan generated", "files", len(p.Files), "has_changelog", p.ChangelogEntry != "", "has_roadmap_update", p.RoadmapUpdate != "")
 
@@ -182,7 +185,6 @@ func run() (err error) {
 	if err := logStep("apply_plan", func() error { return apply.Execute(p) }); err != nil {
 		return err
 	}
-
 	if err := logStep("append_changelog", func() error { return policy.AppendChangelog(p.ChangelogEntry) }); err != nil {
 		return err
 	}
@@ -192,19 +194,36 @@ func run() (err error) {
 		}
 	}
 
-	filesChanged, linesChanged, newFiles, err := computeAndValidateDiffBudget(cfg)
+	stats, err := computeAndCheckBudget(cfg)
 	if err != nil {
 		gitops.ResetHard()
 		return err
 	}
+	if stats.FilesChanged == 0 && stats.LinesChanged == 0 && stats.NewFiles == 0 {
+		summary = "No changes produced"
+		slog.Info("run ended with no produced changes", "summary", summary)
+		setOutput("changed", "false")
+		setOutput("summary", summary)
+		return nil
+	}
 
 	if err := logStep("verify_with_repair", func() error {
-		return verifyWithRepair(client, ctx, cfg, p, &filesChanged, &linesChanged, &newFiles)
+		return verifyWithRepair(cfg, repo, client, p)
 	}); err != nil {
 		gitops.ResetHard()
 		return err
 	}
 
+	// Recompute final stats after any repair edits/actions.
+	stats, err = computeAndCheckBudget(cfg)
+	if err != nil {
+		gitops.ResetHard()
+		return err
+	}
+
+	if strings.TrimSpace(p.Summary) == "" {
+		p.Summary = "evolver changes"
+	}
 	if err := logStep("git_commit", func() error { return gitops.Commit(p.Summary) }); err != nil {
 		return err
 	}
@@ -215,7 +234,7 @@ func run() (err error) {
 		}
 		var url string
 		if err := logStep("create_pull_request", func() error {
-			prURL, prErr := ghapi.CreatePR(branchName, p.Summary, generatePRBody(p, filesChanged, linesChanged, newFiles))
+			prURL, prErr := ghapi.CreatePR(branchName, p.Summary, generatePRBody(p, stats.FilesChanged, stats.LinesChanged, stats.NewFiles))
 			if prErr != nil {
 				return prErr
 			}
@@ -239,174 +258,306 @@ func run() (err error) {
 	return nil
 }
 
-func verifyWithRepair(client *gemini.Client, ctx *repoctx.Context, cfg *config.Config, p *plan.Plan, filesChanged, linesChanged, newFiles *int) error {
-	report, err := verify.RunCommandsReport(cfg.Commands)
-	if err == nil {
-		return nil
-	}
-
-	var failErr *verify.CommandFailureError
-	if !errors.As(err, &failErr) {
-		return err
-	}
-
-	if !isRepairableFailure(failErr.Result.Kind) {
-		return fmt.Errorf("verification failed (%s) and is not repairable automatically: %w", failErr.Result.Kind, err)
-	}
-
-	lastFailure := failErr.Result
-	for attempt := 1; attempt <= maxRepairAttempts; attempt++ {
-		slog.Warn("verification failed; starting repair attempt",
-			"attempt", attempt,
-			"max_attempts", maxRepairAttempts,
-			"command", lastFailure.Command,
-			"exit_code", lastFailure.ExitCode,
-			"kind", lastFailure.Kind,
-		)
-
-		failureContext := buildFailureContext(report, lastFailure, attempt)
-		var repair *plan.Plan
-		if genErr := func() error {
-			var err error
-			repair, err = client.GenerateRepairPlan(ctx, cfg, p.Summary, failureContext)
-			return err
-		}(); genErr != nil {
-			return fmt.Errorf("generate repair plan attempt %d: %w", attempt, genErr)
-		}
-
-		// Force repair mode behavior: keep metadata stable, patch code only.
-		repair.ChangelogEntry = ""
-		repair.RoadmapUpdate = ""
-		if strings.TrimSpace(repair.Summary) == "" {
-			repair.Summary = p.Summary
-		}
-
-		slog.Info("repair plan generated", "attempt", attempt, "files", len(repair.Files))
-
-		if cfg.Security.SecretScan {
-			if err := security.ScanPlan(repair); err != nil {
-				return fmt.Errorf("repair security scan failed: %w", err)
-			}
-		}
-		if err := plan.ValidatePaths(repair, cfg); err != nil {
-			return fmt.Errorf("repair path validation failed: %w", err)
-		}
-		if err := apply.Execute(repair); err != nil {
-			return fmt.Errorf("apply repair attempt %d: %w", attempt, err)
-		}
-
-		fc, lc, nf, err := computeAndValidateDiffBudget(cfg)
-		if err != nil {
-			return fmt.Errorf("repair attempt %d exceeded budget: %w", attempt, err)
-		}
-		*filesChanged, *linesChanged, *newFiles = fc, lc, nf
-
-		report, err = verify.RunCommandsReport(cfg.Commands)
-		if err == nil {
-			slog.Info("repair succeeded", "attempt", attempt)
-			return nil
-		}
-
-		if !errors.As(err, &failErr) {
-			return err
-		}
-		lastFailure = failErr.Result
-
-		if !isRepairableFailure(lastFailure.Kind) {
-			return fmt.Errorf("verification still failing (%s) after repair attempt %d: %w", lastFailure.Kind, attempt, err)
-		}
-	}
-
-	return fmt.Errorf("verification failed after %d repair attempts: %s (kind=%s exit=%d)",
-		maxRepairAttempts, lastFailure.Command, lastFailure.Kind, lastFailure.ExitCode)
+type diffStats struct {
+	FilesChanged int
+	LinesChanged int
+	NewFiles     int
 }
 
-func computeAndValidateDiffBudget(cfg *config.Config) (filesChanged, linesChanged, newFiles int, err error) {
+func computeAndCheckBudget(cfg *config.Config) (diffStats, error) {
 	slog.Info("computing diff stats")
-	filesChanged, linesChanged, err = gitops.DiffStats()
+	filesChanged, linesChanged, err := gitops.DiffStats()
 	if err != nil {
-		return 0, 0, 0, err
+		return diffStats{}, err
 	}
-	newFiles, err = gitops.NewFilesCount()
+	newFiles, err := gitops.NewFilesCount()
 	if err != nil {
-		return 0, 0, 0, err
+		return diffStats{}, err
 	}
-	slog.Info("diff stats computed", "files_changed", filesChanged, "lines_changed", linesChanged, "new_files", newFiles)
+	stats := diffStats{FilesChanged: filesChanged, LinesChanged: linesChanged, NewFiles: newFiles}
+	slog.Info("diff stats computed", "files_changed", stats.FilesChanged, "lines_changed", stats.LinesChanged, "new_files", stats.NewFiles)
 
-	// No actual changes after applying everything => caller handles as needed.
-	if filesChanged == 0 && linesChanged == 0 && newFiles == 0 {
-		return filesChanged, linesChanged, newFiles, nil
-	}
-
-	if filesChanged > cfg.Budgets.MaxFilesChanged || linesChanged > cfg.Budgets.MaxLinesChanged || newFiles > cfg.Budgets.MaxNewFiles {
-		slog.Error("budget exceeded",
-			"files_changed", filesChanged,
-			"lines_changed", linesChanged,
-			"new_files", newFiles,
+	if stats.FilesChanged > cfg.Budgets.MaxFilesChanged || stats.LinesChanged > cfg.Budgets.MaxLinesChanged || stats.NewFiles > cfg.Budgets.MaxNewFiles {
+		slog.Error("budget exceeded; resetting working tree",
+			"files_changed", stats.FilesChanged,
+			"lines_changed", stats.LinesChanged,
+			"new_files", stats.NewFiles,
 			"max_files", cfg.Budgets.MaxFilesChanged,
 			"max_lines", cfg.Budgets.MaxLinesChanged,
 			"max_new_files", cfg.Budgets.MaxNewFiles,
 		)
-		return filesChanged, linesChanged, newFiles, fmt.Errorf("budget exceeded: %d files, %d lines, %d new files", filesChanged, linesChanged, newFiles)
+		return stats, fmt.Errorf("budget exceeded: %d files, %d lines, %d new files", stats.FilesChanged, stats.LinesChanged, stats.NewFiles)
 	}
-
-	return filesChanged, linesChanged, newFiles, nil
+	return stats, nil
 }
 
-func isRepairableFailure(kind string) bool {
-	switch kind {
-	case "compile_failure", "test_failure", "vet_failure", "unknown_failure":
+func verifyWithRepair(cfg *config.Config, repo *repoctx.Context, client *gemini.Client, rootPlan *plan.Plan) error {
+	maxAttempts := cfg.Repair.MaxAttempts
+	if maxAttempts <= 0 {
+		maxAttempts = 2
+	}
+
+	for attempt := 0; ; attempt++ {
+		report, err := verify.RunCommandsReport(cfg.Commands)
+		if err == nil {
+			return nil
+		}
+
+		var cf *verify.CommandFailureError
+		if !errors.As(err, &cf) {
+			return err
+		}
+		failure := cf.Result
+		if isTerminalVerifyFailure(failure.Kind) {
+			slog.Error("verification failed with terminal kind; not attempting repair",
+				"command", failure.Command,
+				"exit_code", failure.ExitCode,
+				"kind", failure.Kind,
+			)
+			return err
+		}
+		if attempt >= maxAttempts {
+			slog.Error("verification failed and repair budget exhausted",
+				"attempt", attempt,
+				"max_attempts", maxAttempts,
+				"command", failure.Command,
+				"kind", failure.Kind,
+			)
+			return err
+		}
+		if client == nil {
+			return err
+		}
+
+		slog.Warn("verification failed; starting repair attempt",
+			"attempt", attempt+1,
+			"max_attempts", maxAttempts,
+			"command", failure.Command,
+			"exit_code", failure.ExitCode,
+			"kind", failure.Kind,
+		)
+
+		allowedCaps := filterRepairCapabilities(cfg.Repair.Capabilities, failure.Kind)
+		repairFailureContext := formatFailureContext(report, failure)
+
+		repairRepo := repo
+		if freshRepo, gerr := repoctx.Gather(cfg); gerr == nil {
+			repairRepo = freshRepo
+		} else {
+			slog.Warn("repair context refresh failed; using initial context", "error", gerr)
+		}
+
+		repairPlan, rerr := client.GenerateRepairPlan(repairRepo, cfg, rootPlan.Summary, repairFailureContext, allowedCaps)
+		if rerr != nil {
+			return fmt.Errorf("repair generation failed (attempt %d/%d): %w", attempt+1, maxAttempts, rerr)
+		}
+		slog.Info("repair plan generated", "attempt", attempt+1, "files", len(repairPlan.Files), "repair_actions", len(repairPlan.RepairActions))
+
+		if cfg.Security.SecretScan {
+			if err := security.ScanPlan(repairPlan); err != nil {
+				return fmt.Errorf("repair plan secret scan failed: %w", err)
+			}
+		}
+		if err := plan.ValidatePaths(repairPlan, cfg); err != nil {
+			return fmt.Errorf("repair plan path validation failed: %w", err)
+		}
+
+		if err := apply.Execute(repairPlan); err != nil {
+			return fmt.Errorf("repair apply failed: %w", err)
+		}
+		if strings.TrimSpace(repairPlan.Summary) != "" {
+			rootPlan.Summary = repairPlan.Summary
+		}
+
+		if err := executeRepairActions(cfg, repairPlan.RepairActions, allowedCaps); err != nil {
+			return fmt.Errorf("repair action failed: %w", err)
+		}
+
+		if _, err := computeAndCheckBudget(cfg); err != nil {
+			return err
+		}
+	}
+}
+
+func isTerminalVerifyFailure(kind string) bool {
+	switch strings.ToLower(strings.TrimSpace(kind)) {
+	case "security_integrity":
 		return true
 	default:
 		return false
 	}
 }
 
-func buildFailureContext(report *verify.Report, failed verify.CommandResult, repairAttempt int) string {
+func formatFailureContext(report *verify.Report, failure verify.CommandResult) string {
 	var b strings.Builder
-	fmt.Fprintf(&b, "Repair attempt: %d\n", repairAttempt)
-	fmt.Fprintf(&b, "Failed command: %s\n", failed.Command)
-	fmt.Fprintf(&b, "Exit code: %d\n", failed.ExitCode)
-	fmt.Fprintf(&b, "Failure kind: %s\n", failed.Kind)
-	fmt.Fprintf(&b, "Duration ms: %d\n", failed.DurationMS)
-
-	if s := truncateForLLM(strings.TrimSpace(failed.Stdout), 6000); s != "" {
+	fmt.Fprintf(&b, "Failed command (%d/%d): %s\n", failure.Index, failure.Total, failure.Command)
+	fmt.Fprintf(&b, "Exit code: %d\n", failure.ExitCode)
+	fmt.Fprintf(&b, "Kind: %s\n", failure.Kind)
+	if strings.TrimSpace(failure.Stdout) != "" {
 		b.WriteString("\nSTDOUT:\n")
-		b.WriteString(s)
-		b.WriteString("\n")
+		b.WriteString(trimForPrompt(failure.Stdout, 8000))
+		b.WriteByte('\n')
 	}
-	if s := truncateForLLM(strings.TrimSpace(failed.Stderr), 10000); s != "" {
+	if strings.TrimSpace(failure.Stderr) != "" {
 		b.WriteString("\nSTDERR:\n")
-		b.WriteString(s)
-		b.WriteString("\n")
+		b.WriteString(trimForPrompt(failure.Stderr, 12000))
+		b.WriteByte('\n')
 	}
-
-	// Include already-passed commands to prevent unnecessary command changes.
 	if report != nil && len(report.Commands) > 0 {
 		b.WriteString("\nVerification results so far:\n")
-		for _, r := range report.Commands {
-			state := "pass"
-			if !r.Passed {
-				state = "fail"
+		for _, c := range report.Commands {
+			status := "PASS"
+			if !c.Passed {
+				status = "FAIL"
 			}
-			fmt.Fprintf(&b, "- [%s] (%d/%d) %s (exit=%d kind=%s)\n", state, r.Index, r.Total, r.Command, r.ExitCode, r.Kind)
+			fmt.Fprintf(&b, "- [%s] %s (exit=%d kind=%s)\n", status, c.Command, c.ExitCode, c.Kind)
 		}
 	}
-
 	return b.String()
 }
 
-func truncateForLLM(s string, max int) string {
+func trimForPrompt(s string, max int) string {
+	s = strings.TrimSpace(s)
 	if max <= 0 || len(s) <= max {
 		return s
 	}
-	const marker = "\n...[truncated]...\n"
-	if max <= len(marker)+32 {
-		return s[:max]
+	keepHead := max * 2 / 3
+	keepTail := max - keepHead
+	return s[:keepHead] + "\n...<truncated>...\n" + s[len(s)-keepTail:]
+}
+
+func filterRepairCapabilities(all []config.RepairCapability, failureKind string) []config.RepairCapability {
+	kind := strings.ToLower(strings.TrimSpace(failureKind))
+	out := make([]config.RepairCapability, 0, len(all))
+	for _, c := range all {
+		if strings.TrimSpace(c.ID) == "" || len(c.Argv) == 0 {
+			continue
+		}
+		if len(c.AllowedFailureKinds) == 0 {
+			out = append(out, c)
+			continue
+		}
+		for _, k := range c.AllowedFailureKinds {
+			if strings.EqualFold(strings.TrimSpace(k), kind) {
+				out = append(out, c)
+				break
+			}
+		}
 	}
-	head := (max - len(marker)) / 2
-	tail := max - len(marker) - head
-	return s[:head] + marker + s[len(s)-tail:]
+	return out
+}
+
+func executeRepairActions(cfg *config.Config, actionIDs []string, allowed []config.RepairCapability) error {
+	if len(actionIDs) == 0 {
+		return nil
+	}
+	maxActions := cfg.Repair.MaxActionsPerAttempt
+	if maxActions <= 0 {
+		maxActions = 2
+	}
+	if len(actionIDs) > maxActions {
+		return fmt.Errorf("too many repair actions requested: %d > %d", len(actionIDs), maxActions)
+	}
+
+	capsByID := make(map[string]config.RepairCapability, len(allowed))
+	for _, c := range allowed {
+		if c.ID == "" {
+			continue
+		}
+		if _, exists := capsByID[c.ID]; exists {
+			return fmt.Errorf("duplicate repair capability id in config: %s", c.ID)
+		}
+		capsByID[c.ID] = c
+	}
+
+	runCounts := make(map[string]int)
+	for i, rawID := range actionIDs {
+		id := strings.TrimSpace(rawID)
+		if id == "" {
+			return fmt.Errorf("repair action %d has empty id", i)
+		}
+		cap, ok := capsByID[id]
+		if !ok {
+			return fmt.Errorf("repair action %q is not allowed for this failure", id)
+		}
+		runCounts[id]++
+		if cap.MaxRunsPerAttempt > 0 && runCounts[id] > cap.MaxRunsPerAttempt {
+			return fmt.Errorf("repair action %q exceeded max_runs_per_attempt (%d)", id, cap.MaxRunsPerAttempt)
+		}
+		if err := runRepairCapability(cap); err != nil {
+			return fmt.Errorf("%s: %w", id, err)
+		}
+	}
+	return nil
+}
+
+func runRepairCapability(cap config.RepairCapability) error {
+	if len(cap.Argv) == 0 {
+		return fmt.Errorf("empty argv")
+	}
+	cwd, err := resolveSafeCapabilityCwd(cap.Cwd)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cap.TimeoutSeconds)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, cap.Argv[0], cap.Argv[1:]...)
+	if cwd != "" {
+		cmd.Dir = cwd
+	}
+
+	var stdoutBuf bytes.Buffer
+	var stderrBuf bytes.Buffer
+	cmd.Stdout = io.MultiWriter(os.Stdout, &stdoutBuf)
+	cmd.Stderr = io.MultiWriter(os.Stderr, &stderrBuf)
+
+	display := strings.Join(cap.Argv, " ")
+	startedAt := time.Now()
+	slog.Info("repair capability command started", "id", cap.ID, "command", display, "cwd", valueOrDot(cwd), "timeout_seconds", cap.TimeoutSeconds)
+	runErr := cmd.Run()
+	durMS := time.Since(startedAt).Milliseconds()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		slog.Error("repair capability command timed out", "id", cap.ID, "command", display, "duration_ms", durMS)
+		return fmt.Errorf("timed out after %ds", cap.TimeoutSeconds)
+	}
+	if runErr != nil {
+		res := verify.CommandResult{Command: display, Stdout: stdoutBuf.String(), Stderr: stderrBuf.String()}
+		kind := verify.ClassifyFailure(res)
+		slog.Error("repair capability command failed", "id", cap.ID, "command", display, "duration_ms", durMS, "kind", kind, "error", runErr)
+		if kind == "security_integrity" {
+			return fmt.Errorf("security-integrity failure while executing repair capability")
+		}
+		return runErr
+	}
+	slog.Info("repair capability command succeeded", "id", cap.ID, "command", display, "duration_ms", durMS)
+	return nil
+}
+
+func resolveSafeCapabilityCwd(cwd string) (string, error) {
+	cwd = strings.TrimSpace(cwd)
+	if cwd == "" || cwd == "." {
+		return "", nil
+	}
+	if filepath.IsAbs(cwd) || strings.HasPrefix(cwd, "..") || strings.Contains(cwd, string(os.PathSeparator)+"..") {
+		return "", fmt.Errorf("unsafe repair capability cwd: %q", cwd)
+	}
+	clean := filepath.Clean(cwd)
+	if clean == "." {
+		return "", nil
+	}
+	if clean == ".." || strings.HasPrefix(clean, ".."+string(os.PathSeparator)) {
+		return "", fmt.Errorf("unsafe repair capability cwd: %q", cwd)
+	}
+	return clean, nil
+}
+
+func valueOrDot(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "."
+	}
+	return s
 }
 
 func logStep(name string, fn func() error) error {
