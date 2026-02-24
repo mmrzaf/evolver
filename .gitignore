@@ -32,8 +32,8 @@ go.work.sum
 .evolver/state.json
 .evolver/runs.log
 .evolver/run.lock
+.evolver/evolver.log
 
 # Editor/IDE
 # .idea/
 # .vscode/
-

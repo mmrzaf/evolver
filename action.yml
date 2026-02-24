@@ -29,6 +29,18 @@ inputs:
     description: "Allow .github/workflows edits"
     required: false
     default: "false"
+  log_level:
+    description: "Log level: debug|info|warn|error"
+    required: false
+    default: "info"
+  log_format:
+    description: "Log format: text|json"
+    required: false
+    default: "text"
+  log_file:
+    description: "Optional log file path"
+    required: false
+    default: ".evolver/evolver.log"
   github_token:
     description: "Optional GitHub token override (defaults to github.token)"
     required: false
@@ -82,5 +94,8 @@ runs:
         EVOLVER_REPO_GOAL: ${{ inputs.repo_goal }}
         EVOLVER_COMMANDS: ${{ inputs.commands }}
         EVOLVER_ALLOW_WORKFLOWS: ${{ inputs.allow_workflow_edits }}
+        EVOLVER_LOG_LEVEL: ${{ inputs.log_level }}
+        EVOLVER_LOG_FORMAT: ${{ inputs.log_format }}
+        EVOLVER_LOG_FILE: ${{ inputs.log_file }}
         GITHUB_TOKEN: ${{ inputs.github_token != '' && inputs.github_token || github.token }}
         GEMINI_API_KEY: ${{ inputs.gemini_api_key }}

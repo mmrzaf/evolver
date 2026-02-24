@@ -1,6 +1,7 @@
 package gitops
 
 import (
+	"log/slog"
 	"os"
 	"os/exec"
 	"strconv"
@@ -14,6 +15,7 @@ func init() {
 
 // CheckoutNew creates and checks out a new git branch.
 func CheckoutNew(branch string) error {
+	slog.Info("creating git branch", "branch", branch)
 	cmd := exec.Command("git", "checkout", "-b", branch)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -22,6 +24,7 @@ func CheckoutNew(branch string) error {
 
 // ResetHard resets tracked and untracked files in the repository.
 func ResetHard() {
+	slog.Warn("resetting git working tree with hard reset and clean")
 	_ = exec.Command("git", "reset", "--hard").Run()
 	_ = exec.Command("git", "clean", "-fd").Run()
 }
@@ -37,6 +40,7 @@ func HasChanges() (bool, error) {
 
 // StageAll stages all changes.
 func StageAll() error {
+	slog.Debug("staging all git changes")
 	cmd := exec.Command("git", "add", ".")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
@@ -62,6 +66,7 @@ func DiffStats() (files, lines int, err error) {
 			lines += add + del
 		}
 	}
+	slog.Info("git diff stats", "files", files, "lines", lines)
 	return files, lines, nil
 }
 
@@ -81,11 +86,13 @@ func NewFilesCount() (int, error) {
 		}
 		count++
 	}
+	slog.Info("git new files count", "new_files", count)
 	return count, nil
 }
 
 // Commit creates a commit from the current working tree.
 func Commit(msg string) error {
+	slog.Info("creating git commit", "message", msg)
 	if err := StageAll(); err != nil {
 		return err
 	}
@@ -97,6 +104,7 @@ func Commit(msg string) error {
 
 // Push pushes the given target ref to origin.
 func Push(target string) error {
+	slog.Info("pushing git ref", "target", target)
 	cmd := exec.Command("git", "push", "origin", target)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr

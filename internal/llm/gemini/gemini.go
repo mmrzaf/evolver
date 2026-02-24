@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -39,12 +40,16 @@ func (c *Client) GeneratePlan(ctx *repoctx.Context, cfg *config.Config) (*plan.P
 	if strings.TrimSpace(c.APIKey) == "" {
 		return nil, fmt.Errorf("missing GEMINI_API_KEY")
 	}
+	slog.Info("gemini plan generation started", "model", c.Model, "max_attempts", c.MaxAttempts)
 	prompt := buildPrompt(ctx, cfg)
 
 	var lastErr error
 	for attempt := 1; attempt <= c.MaxAttempts; attempt++ {
+		attemptStartedAt := time.Now()
+		slog.Info("gemini attempt started", "attempt", attempt, "max_attempts", c.MaxAttempts)
 		text, err := c.generateContent(prompt)
 		if err != nil {
+			slog.Error("gemini request failed", "attempt", attempt, "max_attempts", c.MaxAttempts, "duration_ms", time.Since(attemptStartedAt).Milliseconds(), "error", err)
 			lastErr = err
 			if attempt < c.MaxAttempts {
 				c.waitBeforeRetry(attempt)
@@ -55,8 +60,10 @@ func (c *Client) GeneratePlan(ctx *repoctx.Context, cfg *config.Config) (*plan.P
 
 		p, err := parsePlan(text)
 		if err == nil {
+			slog.Info("gemini attempt succeeded", "attempt", attempt, "max_attempts", c.MaxAttempts, "duration_ms", time.Since(attemptStartedAt).Milliseconds())
 			return p, nil
 		}
+		slog.Warn("gemini response parse failed", "attempt", attempt, "max_attempts", c.MaxAttempts, "duration_ms", time.Since(attemptStartedAt).Milliseconds(), "error", err)
 		lastErr = err
 
 		if attempt < c.MaxAttempts {
@@ -64,6 +71,7 @@ func (c *Client) GeneratePlan(ctx *repoctx.Context, cfg *config.Config) (*plan.P
 			c.waitBeforeRetry(attempt)
 		}
 	}
+	slog.Error("gemini plan generation failed", "model", c.Model, "error", lastErr)
 	if lastErr != nil {
 		return nil, lastErr
 	}

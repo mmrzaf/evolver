@@ -21,6 +21,7 @@ type Config struct {
 	DenyPaths   []string    `yaml:"deny_paths"`
 	Security    Security    `yaml:"security"`
 	Reliability Reliability `yaml:"reliability"`
+	Logging     Logging     `yaml:"logging"`
 }
 
 // Budgets limits the size of generated changes.
@@ -44,6 +45,13 @@ type Reliability struct {
 	LockStaleMinutes int    `yaml:"lock_stale_minutes"`
 }
 
+// Logging configures runtime logging behavior.
+type Logging struct {
+	Level  string `yaml:"level"`
+	Format string `yaml:"format"`
+	File   string `yaml:"file"`
+}
+
 // Load builds config from defaults, file values, and environment overrides.
 func Load() *Config {
 	c := &Config{
@@ -61,6 +69,11 @@ func Load() *Config {
 			RunLogFile:       ".evolver/runs.log",
 			LockFile:         ".evolver/run.lock",
 			LockStaleMinutes: 180,
+		},
+		Logging: Logging{
+			Level:  "info",
+			Format: "text",
+			File:   ".evolver/evolver.log",
 		},
 	}
 
@@ -120,6 +133,15 @@ func Load() *Config {
 	}
 	if v := os.Getenv("EVOLVER_LOCK_STALE_MINUTES"); v != "" {
 		c.Reliability.LockStaleMinutes, _ = strconv.Atoi(v)
+	}
+	if v := os.Getenv("EVOLVER_LOG_LEVEL"); v != "" {
+		c.Logging.Level = v
+	}
+	if v := os.Getenv("EVOLVER_LOG_FORMAT"); v != "" {
+		c.Logging.Format = v
+	}
+	if v := os.Getenv("EVOLVER_LOG_FILE"); v != "" {
+		c.Logging.File = v
 	}
 	return c
 }
