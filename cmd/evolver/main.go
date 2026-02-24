@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -21,6 +22,8 @@ import (
 	"github.com/mmrzaf/evolver/internal/security"
 	"github.com/mmrzaf/evolver/internal/verify"
 )
+
+const maxRepairAttempts = 2
 
 func main() {
 	if err := run(); err != nil {
@@ -123,22 +126,24 @@ func run() (err error) {
 	}
 	slog.Info("repository context ready", "files", len(ctx.Files), "excerpts", len(ctx.Excerpts))
 
-	var p *plan.Plan
+	var client *gemini.Client
 	switch strings.ToLower(strings.TrimSpace(cfg.Provider)) {
 	case "", "gemini":
-		client := gemini.NewClient(os.Getenv("GEMINI_API_KEY"), cfg.Model)
-		if err := logStep("generate_plan_gemini", func() error {
-			planResult, planErr := client.GeneratePlan(ctx, cfg)
-			if planErr != nil {
-				return planErr
-			}
-			p = planResult
-			return nil
-		}); err != nil {
-			return err
-		}
+		client = gemini.NewClient(os.Getenv("GEMINI_API_KEY"), cfg.Model)
 	default:
 		return fmt.Errorf("unsupported provider: %s", cfg.Provider)
+	}
+
+	var p *plan.Plan
+	if err := logStep("generate_plan", func() error {
+		planResult, planErr := client.GeneratePlan(ctx, cfg)
+		if planErr != nil {
+			return planErr
+		}
+		p = planResult
+		return nil
+	}); err != nil {
+		return err
 	}
 	slog.Info("plan generated", "files", len(p.Files), "has_changelog", p.ChangelogEntry != "", "has_roadmap_update", p.RoadmapUpdate != "")
 
@@ -187,40 +192,15 @@ func run() (err error) {
 		}
 	}
 
-	slog.Info("computing diff stats")
-	filesChanged, linesChanged, err := gitops.DiffStats()
+	filesChanged, linesChanged, newFiles, err := computeAndValidateDiffBudget(cfg)
 	if err != nil {
-		return err
-	}
-	newFiles, err := gitops.NewFilesCount()
-	if err != nil {
-		return err
-	}
-	slog.Info("diff stats computed", "files_changed", filesChanged, "lines_changed", linesChanged, "new_files", newFiles)
-
-	// No actual changes after applying everything => stop without committing.
-	if filesChanged == 0 && linesChanged == 0 && newFiles == 0 {
-		summary = "No changes produced"
-		slog.Info("run ended with no produced changes", "summary", summary)
-		setOutput("changed", "false")
-		setOutput("summary", summary)
-		return nil
-	}
-
-	if filesChanged > cfg.Budgets.MaxFilesChanged || linesChanged > cfg.Budgets.MaxLinesChanged || newFiles > cfg.Budgets.MaxNewFiles {
-		slog.Error("budget exceeded; resetting working tree",
-			"files_changed", filesChanged,
-			"lines_changed", linesChanged,
-			"new_files", newFiles,
-			"max_files", cfg.Budgets.MaxFilesChanged,
-			"max_lines", cfg.Budgets.MaxLinesChanged,
-			"max_new_files", cfg.Budgets.MaxNewFiles,
-		)
 		gitops.ResetHard()
-		return fmt.Errorf("budget exceeded: %d files, %d lines, %d new files", filesChanged, linesChanged, newFiles)
+		return err
 	}
 
-	if err := logStep("verify_commands", func() error { return verify.RunCommands(cfg.Commands) }); err != nil {
+	if err := logStep("verify_with_repair", func() error {
+		return verifyWithRepair(client, ctx, cfg, p, &filesChanged, &linesChanged, &newFiles)
+	}); err != nil {
 		gitops.ResetHard()
 		return err
 	}
@@ -257,6 +237,176 @@ func run() (err error) {
 	changed = true
 	summary = p.Summary
 	return nil
+}
+
+func verifyWithRepair(client *gemini.Client, ctx *repoctx.Context, cfg *config.Config, p *plan.Plan, filesChanged, linesChanged, newFiles *int) error {
+	report, err := verify.RunCommandsReport(cfg.Commands)
+	if err == nil {
+		return nil
+	}
+
+	var failErr *verify.CommandFailureError
+	if !errors.As(err, &failErr) {
+		return err
+	}
+
+	if !isRepairableFailure(failErr.Result.Kind) {
+		return fmt.Errorf("verification failed (%s) and is not repairable automatically: %w", failErr.Result.Kind, err)
+	}
+
+	lastFailure := failErr.Result
+	for attempt := 1; attempt <= maxRepairAttempts; attempt++ {
+		slog.Warn("verification failed; starting repair attempt",
+			"attempt", attempt,
+			"max_attempts", maxRepairAttempts,
+			"command", lastFailure.Command,
+			"exit_code", lastFailure.ExitCode,
+			"kind", lastFailure.Kind,
+		)
+
+		failureContext := buildFailureContext(report, lastFailure, attempt)
+		var repair *plan.Plan
+		if genErr := func() error {
+			var err error
+			repair, err = client.GenerateRepairPlan(ctx, cfg, p.Summary, failureContext)
+			return err
+		}(); genErr != nil {
+			return fmt.Errorf("generate repair plan attempt %d: %w", attempt, genErr)
+		}
+
+		// Force repair mode behavior: keep metadata stable, patch code only.
+		repair.ChangelogEntry = ""
+		repair.RoadmapUpdate = ""
+		if strings.TrimSpace(repair.Summary) == "" {
+			repair.Summary = p.Summary
+		}
+
+		slog.Info("repair plan generated", "attempt", attempt, "files", len(repair.Files))
+
+		if cfg.Security.SecretScan {
+			if err := security.ScanPlan(repair); err != nil {
+				return fmt.Errorf("repair security scan failed: %w", err)
+			}
+		}
+		if err := plan.ValidatePaths(repair, cfg); err != nil {
+			return fmt.Errorf("repair path validation failed: %w", err)
+		}
+		if err := apply.Execute(repair); err != nil {
+			return fmt.Errorf("apply repair attempt %d: %w", attempt, err)
+		}
+
+		fc, lc, nf, err := computeAndValidateDiffBudget(cfg)
+		if err != nil {
+			return fmt.Errorf("repair attempt %d exceeded budget: %w", attempt, err)
+		}
+		*filesChanged, *linesChanged, *newFiles = fc, lc, nf
+
+		report, err = verify.RunCommandsReport(cfg.Commands)
+		if err == nil {
+			slog.Info("repair succeeded", "attempt", attempt)
+			return nil
+		}
+
+		if !errors.As(err, &failErr) {
+			return err
+		}
+		lastFailure = failErr.Result
+
+		if !isRepairableFailure(lastFailure.Kind) {
+			return fmt.Errorf("verification still failing (%s) after repair attempt %d: %w", lastFailure.Kind, attempt, err)
+		}
+	}
+
+	return fmt.Errorf("verification failed after %d repair attempts: %s (kind=%s exit=%d)",
+		maxRepairAttempts, lastFailure.Command, lastFailure.Kind, lastFailure.ExitCode)
+}
+
+func computeAndValidateDiffBudget(cfg *config.Config) (filesChanged, linesChanged, newFiles int, err error) {
+	slog.Info("computing diff stats")
+	filesChanged, linesChanged, err = gitops.DiffStats()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	newFiles, err = gitops.NewFilesCount()
+	if err != nil {
+		return 0, 0, 0, err
+	}
+	slog.Info("diff stats computed", "files_changed", filesChanged, "lines_changed", linesChanged, "new_files", newFiles)
+
+	// No actual changes after applying everything => caller handles as needed.
+	if filesChanged == 0 && linesChanged == 0 && newFiles == 0 {
+		return filesChanged, linesChanged, newFiles, nil
+	}
+
+	if filesChanged > cfg.Budgets.MaxFilesChanged || linesChanged > cfg.Budgets.MaxLinesChanged || newFiles > cfg.Budgets.MaxNewFiles {
+		slog.Error("budget exceeded",
+			"files_changed", filesChanged,
+			"lines_changed", linesChanged,
+			"new_files", newFiles,
+			"max_files", cfg.Budgets.MaxFilesChanged,
+			"max_lines", cfg.Budgets.MaxLinesChanged,
+			"max_new_files", cfg.Budgets.MaxNewFiles,
+		)
+		return filesChanged, linesChanged, newFiles, fmt.Errorf("budget exceeded: %d files, %d lines, %d new files", filesChanged, linesChanged, newFiles)
+	}
+
+	return filesChanged, linesChanged, newFiles, nil
+}
+
+func isRepairableFailure(kind string) bool {
+	switch kind {
+	case "compile_failure", "test_failure", "vet_failure", "unknown_failure":
+		return true
+	default:
+		return false
+	}
+}
+
+func buildFailureContext(report *verify.Report, failed verify.CommandResult, repairAttempt int) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Repair attempt: %d\n", repairAttempt)
+	fmt.Fprintf(&b, "Failed command: %s\n", failed.Command)
+	fmt.Fprintf(&b, "Exit code: %d\n", failed.ExitCode)
+	fmt.Fprintf(&b, "Failure kind: %s\n", failed.Kind)
+	fmt.Fprintf(&b, "Duration ms: %d\n", failed.DurationMS)
+
+	if s := truncateForLLM(strings.TrimSpace(failed.Stdout), 6000); s != "" {
+		b.WriteString("\nSTDOUT:\n")
+		b.WriteString(s)
+		b.WriteString("\n")
+	}
+	if s := truncateForLLM(strings.TrimSpace(failed.Stderr), 10000); s != "" {
+		b.WriteString("\nSTDERR:\n")
+		b.WriteString(s)
+		b.WriteString("\n")
+	}
+
+	// Include already-passed commands to prevent unnecessary command changes.
+	if report != nil && len(report.Commands) > 0 {
+		b.WriteString("\nVerification results so far:\n")
+		for _, r := range report.Commands {
+			state := "pass"
+			if !r.Passed {
+				state = "fail"
+			}
+			fmt.Fprintf(&b, "- [%s] (%d/%d) %s (exit=%d kind=%s)\n", state, r.Index, r.Total, r.Command, r.ExitCode, r.Kind)
+		}
+	}
+
+	return b.String()
+}
+
+func truncateForLLM(s string, max int) string {
+	if max <= 0 || len(s) <= max {
+		return s
+	}
+	const marker = "\n...[truncated]...\n"
+	if max <= len(marker)+32 {
+		return s[:max]
+	}
+	head := (max - len(marker)) / 2
+	tail := max - len(marker) - head
+	return s[:head] + marker + s[len(s)-tail:]
 }
 
 func logStep(name string, fn func() error) error {
