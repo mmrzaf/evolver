@@ -2,6 +2,7 @@ package apply
 
 import (
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,7 @@ import (
 
 // Execute applies write operations from a generated plan.
 func Execute(p *plan.Plan) error {
+	writes := 0
 	for _, f := range p.Files {
 		if f.Mode != "write" {
 			continue
@@ -29,7 +31,10 @@ func Execute(p *plan.Plan) error {
 		if err := os.WriteFile(cleanPath, []byte(f.Content), 0644); err != nil {
 			return err
 		}
+		writes++
+		slog.Debug("applied file write", "path", cleanPath, "bytes", len(f.Content))
 	}
+	slog.Info("plan applied", "files_written", writes)
 	return nil
 }
 

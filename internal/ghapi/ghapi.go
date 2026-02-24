@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -25,6 +26,7 @@ func CreatePR(head, title, body string) (string, error) {
 	}
 
 	base := getDefaultBranch(repo, token)
+	slog.Info("creating pull request", "repo", repo, "head", head, "base", base)
 
 	reqBody := map[string]string{
 		"title": title,
@@ -53,6 +55,7 @@ func CreatePR(head, title, body string) (string, error) {
 
 	respBody, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		slog.Error("create pull request failed", "repo", repo, "status_code", resp.StatusCode)
 		return "", fmt.Errorf("github api http %d: %s", resp.StatusCode, strings.TrimSpace(string(respBody)))
 	}
 
@@ -65,6 +68,7 @@ func CreatePR(head, title, body string) (string, error) {
 	if res.HTMLURL == "" {
 		return "", fmt.Errorf("github api: missing html_url in response")
 	}
+	slog.Info("pull request created", "repo", repo, "url", res.HTMLURL)
 	return res.HTMLURL, nil
 }
 

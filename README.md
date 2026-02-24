@@ -39,6 +39,9 @@ jobs:
 - `repo_goal`: high-level goal for the agent
 - `commands`: newline-separated verify commands (run after changes)
 - `allow_workflow_edits`: `"true"` to allow `.github/workflows` edits (default: `"false"`)
+- `log_level`: `debug|info|warn|error` (default: `info`)
+- `log_format`: `text|json` (default: `text`)
+- `log_file`: path for persistent logs (default: `.evolver/evolver.log`)
 - `gemini_api_key`: **required**, pass from secrets
 
 ## Outputs

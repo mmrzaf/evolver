@@ -36,6 +36,9 @@ func TestLoadDefaults(t *testing.T) {
 	if c.Reliability.LockStaleMinutes != 180 {
 		t.Fatalf("unexpected reliability defaults: %+v", c.Reliability)
 	}
+	if c.Logging.Level != "info" || c.Logging.Format != "text" || c.Logging.File != ".evolver/evolver.log" {
+		t.Fatalf("unexpected logging defaults: %+v", c.Logging)
+	}
 }
 
 func TestLoadFromFileAndEnvOverrides(t *testing.T) {
@@ -71,6 +74,9 @@ func TestLoadFromFileAndEnvOverrides(t *testing.T) {
 	t.Setenv("EVOLVER_RUN_LOG_FILE", ".evolver/custom_runs.log")
 	t.Setenv("EVOLVER_LOCK_FILE", ".evolver/custom.lock")
 	t.Setenv("EVOLVER_LOCK_STALE_MINUTES", "45")
+	t.Setenv("EVOLVER_LOG_LEVEL", "debug")
+	t.Setenv("EVOLVER_LOG_FORMAT", "json")
+	t.Setenv("EVOLVER_LOG_FILE", ".evolver/custom.log")
 
 	c := Load()
 	if c.Provider != "gemini" {
@@ -102,5 +108,8 @@ func TestLoadFromFileAndEnvOverrides(t *testing.T) {
 	}
 	if c.Reliability.LockStaleMinutes != 45 {
 		t.Fatalf("unexpected reliability numeric overrides: %+v", c.Reliability)
+	}
+	if c.Logging.Level != "debug" || c.Logging.Format != "json" || c.Logging.File != ".evolver/custom.log" {
+		t.Fatalf("unexpected logging overrides: %+v", c.Logging)
 	}
 }
