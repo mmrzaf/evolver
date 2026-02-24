@@ -22,6 +22,7 @@ type Config struct {
 	Security    Security    `yaml:"security"`
 	Reliability Reliability `yaml:"reliability"`
 	Logging     Logging     `yaml:"logging"`
+	Repair      Repair      `yaml:"repair"`
 }
 
 // Budgets limits the size of generated changes.
@@ -52,6 +53,25 @@ type Logging struct {
 	File   string `yaml:"file"`
 }
 
+// Repair configures bounded repair-mode behavior and project-defined capabilities.
+type Repair struct {
+	MaxAttempts          int                `yaml:"max_attempts"`
+	MaxActionsPerAttempt int                `yaml:"max_actions_per_attempt"`
+	Capabilities         []RepairCapability `yaml:"capabilities"`
+}
+
+// RepairCapability is a project-defined, allowlisted repair command.
+// argv is executed directly (no shell), so each token must be its own element.
+type RepairCapability struct {
+	ID                  string   `yaml:"id"`
+	Description         string   `yaml:"description"`
+	Argv                []string `yaml:"argv"`
+	TimeoutSeconds      int      `yaml:"timeout_seconds"`
+	MaxRunsPerAttempt   int      `yaml:"max_runs_per_attempt"`
+	AllowedFailureKinds []string `yaml:"allowed_failure_kinds"`
+	Cwd                 string   `yaml:"cwd,omitempty"`
+}
+
 // Load builds config from defaults, file values, and environment overrides.
 func Load() *Config {
 	c := &Config{
@@ -75,11 +95,56 @@ func Load() *Config {
 			Format: "text",
 			File:   ".evolver/evolver.log",
 		},
+		Repair: Repair{
+			MaxAttempts:          2,
+			MaxActionsPerAttempt: 2,
+			Capabilities:         []RepairCapability{},
+		},
 	}
 
 	// Config file overrides defaults.
 	if b, err := os.ReadFile(".evolver/config.yml"); err == nil {
 		_ = yaml.Unmarshal(b, c)
+	}
+
+	// Normalize and fill sensible defaults for repair capabilities.
+	for i := range c.Repair.Capabilities {
+		cap := &c.Repair.Capabilities[i]
+		cap.ID = strings.TrimSpace(cap.ID)
+		cap.Description = strings.TrimSpace(cap.Description)
+		cap.Cwd = strings.TrimSpace(cap.Cwd)
+		if cap.TimeoutSeconds <= 0 {
+			cap.TimeoutSeconds = 120
+		}
+		if cap.MaxRunsPerAttempt <= 0 {
+			cap.MaxRunsPerAttempt = 1
+		}
+		if len(cap.Argv) > 0 {
+			n := cap.Argv[:0]
+			for _, a := range cap.Argv {
+				a = strings.TrimSpace(a)
+				if a != "" {
+					n = append(n, a)
+				}
+			}
+			cap.Argv = n
+		}
+		if len(cap.AllowedFailureKinds) > 0 {
+			n := cap.AllowedFailureKinds[:0]
+			for _, k := range cap.AllowedFailureKinds {
+				k = strings.TrimSpace(k)
+				if k != "" {
+					n = append(n, strings.ToLower(k))
+				}
+			}
+			cap.AllowedFailureKinds = n
+		}
+	}
+	if c.Repair.MaxAttempts <= 0 {
+		c.Repair.MaxAttempts = 2
+	}
+	if c.Repair.MaxActionsPerAttempt <= 0 {
+		c.Repair.MaxActionsPerAttempt = 2
 	}
 
 	// Environment overrides file and defaults.
@@ -142,6 +207,16 @@ func Load() *Config {
 	}
 	if v := os.Getenv("EVOLVER_LOG_FILE"); v != "" {
 		c.Logging.File = v
+	}
+	if v := os.Getenv("EVOLVER_REPAIR_MAX_ATTEMPTS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.Repair.MaxAttempts = n
+		}
+	}
+	if v := os.Getenv("EVOLVER_REPAIR_MAX_ACTIONS_PER_ATTEMPT"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			c.Repair.MaxActionsPerAttempt = n
+		}
 	}
 	return c
 }

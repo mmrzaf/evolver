@@ -11,10 +11,11 @@ import (
 
 // Plan is the structured output describing repository updates.
 type Plan struct {
-	Summary        string `json:"summary"`
-	Files          []File `json:"files"`
-	ChangelogEntry string `json:"changelog_entry"`
-	RoadmapUpdate  string `json:"roadmap_update"`
+	Summary        string   `json:"summary"`
+	Files          []File   `json:"files"`
+	ChangelogEntry string   `json:"changelog_entry"`
+	RoadmapUpdate  string   `json:"roadmap_update"`
+	RepairActions  []string `json:"repair_actions,omitempty"`
 }
 
 // File describes a single file operation from a plan.

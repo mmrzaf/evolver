@@ -79,13 +79,13 @@ func (c *Client) GeneratePlan(ctx *repoctx.Context, cfg *config.Config) (*plan.P
 }
 
 // GenerateRepairPlan asks Gemini for a minimal repair plan based on a concrete verification failure.
-func (c *Client) GenerateRepairPlan(ctx *repoctx.Context, cfg *config.Config, originalSummary string, failureContext string) (*plan.Plan, error) {
+func (c *Client) GenerateRepairPlan(ctx *repoctx.Context, cfg *config.Config, originalSummary string, failureContext string, capabilities []config.RepairCapability) (*plan.Plan, error) {
 	if strings.TrimSpace(c.APIKey) == "" {
 		return nil, fmt.Errorf("missing GEMINI_API_KEY")
 	}
 	slog.Info("gemini repair generation started", "model", c.Model, "max_attempts", c.MaxAttempts)
 
-	prompt := buildRepairPrompt(ctx, cfg, originalSummary, failureContext)
+	prompt := buildRepairPrompt(ctx, cfg, originalSummary, failureContext, capabilities)
 	var lastErr error
 
 	for attempt := 1; attempt <= c.MaxAttempts; attempt++ {
@@ -112,7 +112,7 @@ func (c *Client) GenerateRepairPlan(ctx *repoctx.Context, cfg *config.Config, or
 		slog.Warn("gemini repair response parse failed", "attempt", attempt, "max_attempts", c.MaxAttempts, "duration_ms", time.Since(attemptStartedAt).Milliseconds(), "error", err)
 		lastErr = err
 		if attempt < c.MaxAttempts {
-			prompt = buildRepairFixupPrompt(cfg, failureContext, text, err)
+			prompt = buildRepairFixupPrompt(cfg, failureContext, capabilities, text, err)
 			c.waitBeforeRetry(attempt)
 		}
 	}
@@ -242,8 +242,9 @@ Here is your previous response for correction:
 %s`, parseErr.Error(), strings.TrimSpace(lastText))
 }
 
-func buildRepairPrompt(ctx *repoctx.Context, cfg *config.Config, originalSummary string, failureContext string) string {
+func buildRepairPrompt(ctx *repoctx.Context, cfg *config.Config, originalSummary string, failureContext string, capabilities []config.RepairCapability) string {
 	d, _ := json.Marshal(ctx)
+	capsJSON, _ := json.Marshal(summarizeCapabilities(capabilities))
 
 	return fmt.Sprintf(`You are repairing a repository change that failed verification.
 
@@ -253,6 +254,8 @@ Goal:
 - Do NOT rewrite unrelated files.
 - Prefer edits only in files implicated by the error output.
 - Do NOT change verification commands.
+- You may optionally request project-allowed repair actions by ID from the provided list.
+- Only use repair_actions when they directly address the failure.
 - Keep changelog_entry and roadmap_update empty unless absolutely necessary.
 
 Original change summary:
@@ -261,17 +264,23 @@ Original change summary:
 Verification failure context:
 %s
 
+Available repair capabilities (JSON):
+%s
+
 Hard rules:
 - Stay under %d files changed, %d lines changed, %d new files (cumulative budget still applies).
 - Workflow edits: %t.
 - Output ONLY valid JSON matching this exact schema (no markdown, no commentary):
-{"summary": "...", "files": [{"path": "...", "mode": "write", "content": "..."}], "changelog_entry": "", "roadmap_update": ""}
+{"summary": "...", "files": [{"path": "...", "mode": "write", "content": "..."}], "changelog_entry": "", "roadmap_update": "", "repair_actions": ["capability_id"]}
+- repair_actions must contain only IDs from the provided capability list.
+- If no repair action is needed, return repair_actions as [] or omit it.
 
 Repository context (JSON):
-%s`, strings.TrimSpace(originalSummary), strings.TrimSpace(failureContext), cfg.Budgets.MaxFilesChanged, cfg.Budgets.MaxLinesChanged, cfg.Budgets.MaxNewFiles, cfg.Security.AllowWorkflowEdits, string(d))
+%s`, strings.TrimSpace(originalSummary), strings.TrimSpace(failureContext), string(capsJSON), cfg.Budgets.MaxFilesChanged, cfg.Budgets.MaxLinesChanged, cfg.Budgets.MaxNewFiles, cfg.Security.AllowWorkflowEdits, string(d))
 }
 
-func buildRepairFixupPrompt(cfg *config.Config, failureContext string, lastText string, parseErr error) string {
+func buildRepairFixupPrompt(cfg *config.Config, failureContext string, capabilities []config.RepairCapability, lastText string, parseErr error) string {
+	capsJSON, _ := json.Marshal(summarizeCapabilities(capabilities))
 	return fmt.Sprintf(`Your repair response was invalid JSON.
 
 Parse error:
@@ -280,9 +289,27 @@ Parse error:
 Verification failure context (for reference):
 %s
 
+Available repair capabilities (JSON):
+%s
+
 Return ONLY valid JSON matching this exact schema (no fences, no commentary):
-{"summary": "...", "files": [{"path": "...", "mode": "write", "content": "..."}], "changelog_entry": "", "roadmap_update": ""}
+{"summary": "...", "files": [{"path": "...", "mode": "write", "content": "..."}], "changelog_entry": "", "roadmap_update": "", "repair_actions": ["capability_id"]}
 
 Previous invalid response:
-%s`, parseErr.Error(), strings.TrimSpace(failureContext), strings.TrimSpace(lastText))
+%s`, parseErr.Error(), strings.TrimSpace(failureContext), string(capsJSON), strings.TrimSpace(lastText))
+}
+
+func summarizeCapabilities(caps []config.RepairCapability) []map[string]any {
+	out := make([]map[string]any, 0, len(caps))
+	for _, c := range caps {
+		m := map[string]any{
+			"id":          c.ID,
+			"description": c.Description,
+		}
+		if len(c.AllowedFailureKinds) > 0 {
+			m["allowed_failure_kinds"] = c.AllowedFailureKinds
+		}
+		out = append(out, m)
+	}
+	return out
 }

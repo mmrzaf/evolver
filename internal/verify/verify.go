@@ -137,6 +137,15 @@ func ClassifyFailure(res CommandResult) string {
 	text := strings.ToLower(res.Stdout + "\n" + res.Stderr)
 
 	switch {
+	case strings.Contains(text, "checksum mismatch"),
+		strings.Contains(text, "security error"),
+		strings.Contains(text, "sum.golang.org"),
+		strings.Contains(text, "verifying module:"):
+		return "security_integrity"
+	case strings.Contains(text, "missing go.sum entry"),
+		strings.Contains(text, "updates to go.mod needed"),
+		strings.Contains(text, "updates to go.sum needed"):
+		return "dependency_manifest_missing"
 	case strings.Contains(text, "command not found"),
 		strings.Contains(text, "executable file not found"),
 		strings.Contains(text, "not recognized as an internal or external command"):
@@ -156,7 +165,7 @@ func ClassifyFailure(res CommandResult) string {
 		return "dependency_fetch"
 	case strings.Contains(text, "panic:"),
 		strings.Contains(text, "--- fail:"),
-		strings.Contains(text, "expected") && strings.Contains(text, "got"):
+		(strings.Contains(text, "expected") && strings.Contains(text, "got")):
 		return "test_failure"
 	case strings.Contains(text, "undefined:"),
 		strings.Contains(text, "cannot use"),
