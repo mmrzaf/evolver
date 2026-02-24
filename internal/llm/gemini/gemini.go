@@ -78,6 +78,52 @@ func (c *Client) GeneratePlan(ctx *repoctx.Context, cfg *config.Config) (*plan.P
 	return nil, fmt.Errorf("failed to generate plan")
 }
 
+// GenerateRepairPlan asks Gemini for a minimal repair plan based on a concrete verification failure.
+func (c *Client) GenerateRepairPlan(ctx *repoctx.Context, cfg *config.Config, originalSummary string, failureContext string) (*plan.Plan, error) {
+	if strings.TrimSpace(c.APIKey) == "" {
+		return nil, fmt.Errorf("missing GEMINI_API_KEY")
+	}
+	slog.Info("gemini repair generation started", "model", c.Model, "max_attempts", c.MaxAttempts)
+
+	prompt := buildRepairPrompt(ctx, cfg, originalSummary, failureContext)
+	var lastErr error
+
+	for attempt := 1; attempt <= c.MaxAttempts; attempt++ {
+		attemptStartedAt := time.Now()
+		slog.Info("gemini repair attempt started", "attempt", attempt, "max_attempts", c.MaxAttempts)
+
+		text, err := c.generateContent(prompt)
+		if err != nil {
+			slog.Error("gemini repair request failed", "attempt", attempt, "max_attempts", c.MaxAttempts, "duration_ms", time.Since(attemptStartedAt).Milliseconds(), "error", err)
+			lastErr = err
+			if attempt < c.MaxAttempts {
+				c.waitBeforeRetry(attempt)
+				continue
+			}
+			break
+		}
+
+		p, err := parsePlan(text)
+		if err == nil {
+			slog.Info("gemini repair attempt succeeded", "attempt", attempt, "max_attempts", c.MaxAttempts, "duration_ms", time.Since(attemptStartedAt).Milliseconds())
+			return p, nil
+		}
+
+		slog.Warn("gemini repair response parse failed", "attempt", attempt, "max_attempts", c.MaxAttempts, "duration_ms", time.Since(attemptStartedAt).Milliseconds(), "error", err)
+		lastErr = err
+		if attempt < c.MaxAttempts {
+			prompt = buildRepairFixupPrompt(cfg, failureContext, text, err)
+			c.waitBeforeRetry(attempt)
+		}
+	}
+
+	slog.Error("gemini repair generation failed", "model", c.Model, "error", lastErr)
+	if lastErr != nil {
+		return nil, lastErr
+	}
+	return nil, fmt.Errorf("failed to generate repair plan")
+}
+
 func (c *Client) waitBeforeRetry(attempt int) {
 	if c.RetryBaseDelay <= 0 {
 		return
@@ -184,7 +230,6 @@ Repository context (JSON):
 }
 
 func buildFixupPrompt(ctx *repoctx.Context, cfg *config.Config, lastText string, parseErr error) string {
-	// Keep this short to reduce token waste, but include the invalid payload.
 	return fmt.Sprintf(`Your previous response was invalid and could not be parsed as JSON.
 
 Error:
@@ -195,4 +240,49 @@ Return ONLY valid JSON matching this exact schema (no fences, no commentary):
 
 Here is your previous response for correction:
 %s`, parseErr.Error(), strings.TrimSpace(lastText))
+}
+
+func buildRepairPrompt(ctx *repoctx.Context, cfg *config.Config, originalSummary string, failureContext string) string {
+	d, _ := json.Marshal(ctx)
+
+	return fmt.Sprintf(`You are repairing a repository change that failed verification.
+
+Goal:
+- Fix the verification failure with the smallest possible patch.
+- Preserve the intended behavior unless the failure proves it is wrong.
+- Do NOT rewrite unrelated files.
+- Prefer edits only in files implicated by the error output.
+- Do NOT change verification commands.
+- Keep changelog_entry and roadmap_update empty unless absolutely necessary.
+
+Original change summary:
+%s
+
+Verification failure context:
+%s
+
+Hard rules:
+- Stay under %d files changed, %d lines changed, %d new files (cumulative budget still applies).
+- Workflow edits: %t.
+- Output ONLY valid JSON matching this exact schema (no markdown, no commentary):
+{"summary": "...", "files": [{"path": "...", "mode": "write", "content": "..."}], "changelog_entry": "", "roadmap_update": ""}
+
+Repository context (JSON):
+%s`, strings.TrimSpace(originalSummary), strings.TrimSpace(failureContext), cfg.Budgets.MaxFilesChanged, cfg.Budgets.MaxLinesChanged, cfg.Budgets.MaxNewFiles, cfg.Security.AllowWorkflowEdits, string(d))
+}
+
+func buildRepairFixupPrompt(cfg *config.Config, failureContext string, lastText string, parseErr error) string {
+	return fmt.Sprintf(`Your repair response was invalid JSON.
+
+Parse error:
+%s
+
+Verification failure context (for reference):
+%s
+
+Return ONLY valid JSON matching this exact schema (no fences, no commentary):
+{"summary": "...", "files": [{"path": "...", "mode": "write", "content": "..."}], "changelog_entry": "", "roadmap_update": ""}
+
+Previous invalid response:
+%s`, parseErr.Error(), strings.TrimSpace(failureContext), strings.TrimSpace(lastText))
 }
